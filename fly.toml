@@ -3,8 +3,8 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'dca5'
-primary_region = 'iod'
+app = 'mldca'
+primary_region = 'iot'
 
 [build]
 
@@ -17,7 +17,7 @@ primary_region = 'iod'
   processes = ['app']
 
 [[mounts]]
-  source = 'dca5_data'
+  source = 'mldca_data'
   destination = '/data'
 
 [[vm]]
