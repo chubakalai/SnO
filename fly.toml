@@ -1,12 +1,16 @@
-# fly.toml app configuration file generated for dca5 on 2026-07-28T09:12:20Z
+# fly.toml app configuration file generated for sno on 2026-08-10T17:13:20Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'mldca'
-primary_region = 'iot'
+app = 'sno'
+primary_region = 'ams'
 
 [build]
+
+[[mounts]]
+  source = 'mldca_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
@@ -15,10 +19,6 @@ primary_region = 'iot'
   auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
-
-[[mounts]]
-  source = 'mldca_data'
-  destination = '/data'
 
 [[vm]]
   memory = '1gb'
