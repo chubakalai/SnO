@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """
-DCA5-Bot — 5-Symbol 90-Day DCA Short Bot, priced and sized at rolling 9-day high
+MultiLongDCA-Bot — Multi-Symbol (USOIL_USDT WTI Crude + SILVER_USDT
+XAG Silver) DCA Long Bot, each symbol priced and sized independently
+at its own rolling 9-day low, each with its own independent budget
+and window.
 
 Single-process, single-machine bot for Fly.io.
 
+This is a multi-symbol extension of OilLongDCA-Bot (itself a
+direction-reversed derivative of the earlier DCA5-Bot). Every symbol
+in SYMBOLS is treated fully independently: its own budget, its own
+window, its own fire history, its own 9-day-low computation. Nothing
+is pooled or shared across symbols except the process, the HTTP
+status server, and the state file.
+
 Behavior:
-  - On startup: run a one-time TEST order (limit short at market+10%,
+  - On startup: run a one-time TEST order (limit LONG at market-10%,
     held 60s, then cancelled if unfilled) against EVERY symbol in
     SYMBOLS, one at a time, sequentially, to validate the signing and
     order-placement/cancellation path for each symbol's own specs
@@ -13,43 +23,49 @@ Behavior:
     symbol's test is independent — one symbol failing its test does
     not stop the others from being tested or stop the engine loop
     from starting afterward. This adds ~len(SYMBOLS) x
-    TEST_ORDER_WAIT_SEC to startup time (currently ~5 minutes for 5
-    symbols at 60s each) — unavoidable if each symbol's fill/cancel
-    path is to be genuinely validated rather than assumed.
-  - Every hour on the hour: refresh mark prices + rolling 9d highs for
+    TEST_ORDER_WAIT_SEC to startup time (currently ~2 minutes for 2
+    symbols at 60s each).
+  - Every hour on the hour: refresh mark prices + rolling 9d lows for
     all symbols and refresh the in-memory SVG status table.
   - Only at hour == 00 UTC: for each symbol, if today's calendar date
-    falls within that symbol's 90-day DCA window (per-symbol start
+    falls within THAT SYMBOL'S OWN 90-day DCA window (per-symbol start
     dates hardcoded below) AND that symbol has not already fired today
-    (per persisted fire-history), place a limit SHORT priced AND SIZED
-    at that symbol's current trailing 9-day high (including today's
+    (per persisted fire-history), place a limit LONG priced AND SIZED
+    at that symbol's current trailing 9-day low (including today's
     not-yet-closed bar via the daily klines fetch — see
-    rolling_9d_high) for that day's slice (budget / 90).
+    rolling_9d_low) for that day's slice (that symbol's own budget /
+    that symbol's own DCA_DAYS).
 
-    Sizing uses the 9d-high price (the limit price itself), NOT mark.
-    Reasoning: a resting limit short fills at its limit price or
+    Each symbol's daily slice is computed from ITS OWN budget and day
+    count (DCA_BUDGET_USD[sym] / DCA_DAYS[sym]), not a shared pool —
+    two symbols can in principle run different budgets or different
+    windows without restructuring the code, though both are currently
+    configured identically ($1000 / 90 days / starting 2026-08-10).
+
+    Sizing uses the 9d-low price (the limit price itself), NOT mark.
+    Reasoning: a resting limit long fills at its limit price or
     better, essentially never at mark (mark is only relevant to
-    orders that trade immediately) — the 9d-high is the ONLY price
+    orders that trade immediately) — the 9d-low is the ONLY price
     this order will actually transact at if it fills at all. Sizing
-    off mark while pricing off the 9d-high would guarantee every fill
-    is worth more than $22.22 (by exactly the ratio of 9d-high/mark),
-    which defeats the purpose of a fixed daily dollar slice. Sizing
-    off the 9d-high itself makes the notional-at-fill exactly $22.22,
-    which is the correct target for a DCA program. Mark is still
-    fetched and logged for visibility/context, just not used for
-    sizing.
+    off mark while pricing off the 9d-low would guarantee every fill
+    is worth LESS than the intended daily dollar slice (by exactly
+    the ratio of 9dLow/mark), which defeats the purpose of a fixed
+    daily dollar slice. Sizing off the 9d-low itself makes the
+    notional-at-fill exactly the daily slice amount, which is the
+    correct target for a DCA program. Mark is still fetched and
+    logged for visibility/context, just not used for sizing.
 
     The order is left open with no timeout — if a previous day's
     order for that symbol is still unfilled, it is left resting and a
     new order is placed on top of it (orders stack; nothing is ever
     cancelled by the daily engine).
-  - Pricing every day's DCA slice at the rolling 9d high (rather than
+  - Pricing every day's DCA slice at the rolling 9d low (rather than
     at mark) is a deliberate choice: it reaches for a better-than-
-    market short price every day, and naturally scales with each
-    symbol's own volatility (a choppier symbol's 9d high sits further
-    above mark without any separate volatility calculation needed).
-    The tradeoff is that in a sustained uptrend the 9d high chases
-    price upward and fills may not be much better than mark, and
+    market long entry every day, and naturally scales with each
+    symbol's own volatility (a choppier symbol's 9d low sits further
+    below mark without any separate volatility calculation needed).
+    The tradeoff is that in a sustained downtrend the 9d low chases
+    price downward and fills may not be much better than mark, and
     resting orders may take a long time (or never) to fill.
   - If a symbol's daily klines can't be fetched or return fewer than
     ROLL_DAYS closed bars on a given midnight wake, that symbol is
@@ -61,7 +77,7 @@ Behavior:
     persisted to a local JSON file and checked before every fire.
     This is the one persisted state in this script; a DCA schedule is
     not self-healing from exchange state alone the way a pure
-    rolling-high trigger is, so this file is required for correctness
+    rolling-low trigger is, so this file is required for correctness
     across restarts.
   - Every placed order is logged (id, symbol, price, usd, contracts)
     and recorded into the same local JSON state file alongside fire
@@ -80,7 +96,8 @@ Environment (secrets only, not behavior):
   MEXCSECRET  - MEXC API secret
 
 CONFIRMED VIA LIVE DIAGNOSTIC RUNS (carried over from the original
-SP9H-Bot's diagnostics — same account/endpoints, so still applicable):
+SP9H-Bot / DCA5-Bot diagnostics — same account/endpoints, so still
+applicable):
   - Kline endpoint returns data as a dict of parallel arrays, keyed by
     field name, with 'real*' fields for actual traded OHLC, timestamps
     in Unix seconds (confirmed via fetch_mexc_klines.py).
@@ -94,18 +111,35 @@ SP9H-Bot's diagnostics — same account/endpoints, so still applicable):
     that extracts an order id from a create-order response must read
     data["orderId"], not data itself (confirmed via test_order_flow.py,
     where the earlier bug was traced to this exact mismatch).
+  - USOIL_USDT's symbol string and specs (priceUnit=0.01, volUnit=1,
+    contractSize=0.01, state=0/active) were confirmed live via
+    /api/v1/contract/detail on 2026-08-10 (find_oil_symbol.py). It is
+    quoted and settled in USDT, distinct from the USD1-settled
+    USOIL_USD1 contract, and distinct from UKOIL_USDT (Brent, not
+    WTI).
+  - SILVER_USDT's symbol string and specs (priceUnit=0.01, volUnit=1,
+    contractSize=0.01, state=0/active) were confirmed live via
+    /api/v1/contract/detail on 2026-08-10 (find_silver_symbol.py). It
+    is quoted and settled in USDT, distinct from the USDC-settled
+    SILVER_USDC and USD1-settled SILVER_USD1 contracts. Note: MEXC's
+    stated max leverage for this contract has changed over time in
+    public announcements (seen as low as 20x and as high as 500x-1000x
+    across different sources); the live contract-detail response is
+    authoritative and reported maxLeverage=1000 as of the above date.
+    This script's hardcoded LEVERAGE=30 sits well under any of these
+    figures, but the ceiling itself should not be assumed stable.
 
 NOT YET CONFIRMED FOR THIS VERSION:
-  - Contract specs (tick size, min size, contract size) for BTC_USDT,
-    ETH_USDT, SOL_USDT, and XRP_USDT are fetched the same way as
-    SPX500_USDT via load_specs(), and the startup test order now
-    exercises the full place/cancel path for each of them individually
-    (see run_startup_test_orders below) — but this is the FIRST time
-    that validation runs; watch the startup logs on first deploy for
-    any per-symbol test failures.
-  - The daily-kline shape (real* fields, Unix-seconds timestamps) is
-    assumed to hold across all 5 MEXC futures symbols; only directly
-    confirmed for SPX500_USDT in the original script's diagnostics.
+  - The daily-kline shape (real* fields, Unix-seconds timestamps, and
+    specifically the 'realLow'/'low' fields this bot depends on) is
+    assumed to hold for both USOIL_USDT and SILVER_USDT by extension
+    from the original script's SPX500_USDT diagnostics, but has not
+    been directly confirmed for either symbol. Watch the first few
+    engine cycles' logs for 9d-low values that look sane relative to
+    logged mark prices, for BOTH symbols independently.
+  - The startup test order exercises the full place/cancel path for
+    SILVER_USDT for the first time under this script; watch startup
+    logs on first deploy for any per-symbol test failures.
 """
 
 import datetime
@@ -135,37 +169,48 @@ MEXC_KEY    = os.getenv("MEXC")
 MEXC_SECRET = os.getenv("MEXCSECRET")
 MEXC_BASE   = "https://api.mexc.co"
 
-# Symbols in this DCA program. The startup test order now validates
-# EVERY one of these, not just one.
-SYMBOLS = ["SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT"]
+# Symbols in this DCA program. Both confirmed live via
+# /api/v1/contract/detail on 2026-08-10 — see module docstring.
+SYMBOLS = ["USOIL_USDT", "SILVER_USDT"]
 
 LEVERAGE  = 30
-ROLL_DAYS = 9   # trailing window for the 9-day-high price target, including today
+ROLL_DAYS = 9   # trailing window for the 9-day-low price target, including today
 
 # ── DCA schedule ───────────────────────────────────────────────────────────────
-# Each symbol gets its own $2000 budget split evenly across DCA_DAYS
-# daily fires. Aug 1 2026 -> Oct 29 2026 inclusive is 90 UTC calendar days.
-DCA_BUDGET_USD = 1000.0
-DCA_DAYS       = 90
-DCA_DAILY_USD  = DCA_BUDGET_USD / DCA_DAYS  # ~22.22
+# Each symbol has its OWN independent budget and day count — these are
+# per-symbol dicts, not shared scalars. A symbol's daily slice is
+# DCA_BUDGET_USD[sym] / DCA_DAYS[sym]. Both symbols are currently
+# configured identically ($1000 / 90 days), but the structure supports
+# divergent per-symbol schedules without further code changes.
+DCA_BUDGET_USD: Dict[str, float] = {
+    "USOIL_USDT":  1000.0,
+    "SILVER_USDT": 1000.0,
+}
+DCA_DAYS: Dict[str, int] = {
+    "USOIL_USDT":  90,
+    "SILVER_USDT": 90,
+}
+DCA_DAILY_USD: Dict[str, float] = {
+    sym: DCA_BUDGET_USD[sym] / DCA_DAYS[sym] for sym in SYMBOLS
+}  # ~11.11 each
 
-# Per-symbol start date (UTC calendar date). All symbols share the same
-# 90-day window here (Aug/Sep/Oct 2026) per spec, but this is per-symbol
-# so schedules can be staggered later without restructuring the code.
+# Per-symbol start date (UTC calendar date). Both start 2026-08-10 per
+# spec, but this is per-symbol so schedules can be staggered later
+# without restructuring the code.
 DCA_START_DATE: Dict[str, datetime.date] = {
-    sym: datetime.date(2026, 8, 1) for sym in SYMBOLS
+    sym: datetime.date(2026, 8, 10) for sym in SYMBOLS
 }
 
 def in_dca_window(sym: str, d: datetime.date) -> bool:
     start = DCA_START_DATE[sym]
-    end   = start + datetime.timedelta(days=DCA_DAYS - 1)
+    end   = start + datetime.timedelta(days=DCA_DAYS[sym] - 1)
     return start <= d <= end
 
 HOURLY_SLEEP_FLOOR_SEC = 5   # small buffer after top-of-hour before waking
 
-TEST_ORDER_PREMIUM   = 1.10   # market + 10%
-TEST_ORDER_WAIT_SEC  = 60
-TEST_ORDER_USD       = 75.0   # sizing test only, unrelated to DCA_DAILY_USD
+TEST_ORDER_DISCOUNT   = 0.90   # market - 10% (long-side test: priced BELOW mark)
+TEST_ORDER_WAIT_SEC   = 60
+TEST_ORDER_USD        = 75.0   # sizing test only, unrelated to DCA_DAILY_USD
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(os.getenv("PORT", "8080"))  # Fly.io injects PORT; not a behavior param
@@ -173,7 +218,7 @@ HTTP_PORT = int(os.getenv("PORT", "8080"))  # Fly.io injects PORT; not a behavio
 # Persistence: fire history AND a record of every placed order, so
 # resting/stacked orders can be cross-checked against MEXC's own
 # open-orders API without relying on memory alone across restarts.
-STATE_FILE = os.getenv("DCA_STATE_FILE", "/data/dca_fire_history.json")
+STATE_FILE = os.getenv("DCA_STATE_FILE", "/data/multi_dca_fire_history.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger()
@@ -308,7 +353,7 @@ def load_specs():
     for sym in SYMBOLS:
         match = by_sym[sym]
         vu = float(match.get("volUnit", 1))
-        pu = float(match.get("priceUnit", 0.5))
+        pu = float(match.get("priceUnit", 0.01))
         cs = float(match.get("contractSize", vu))
         raw = f"{vu:.10f}".rstrip("0")
         p = len(raw.split(".")[1]) if "." in raw else 0
@@ -316,7 +361,7 @@ def load_specs():
         log.info(f"loaded specs for {sym}: {specs[sym]}")
 
 def _tick(sym):
-    return specs.get(sym, {}).get("t", 0.5)
+    return specs.get(sym, {}).get("t", 0.01)
 
 def _prec(sym):
     return specs.get(sym, {}).get("p", 0)
@@ -347,7 +392,7 @@ def _contracts(sym, usd, price):
 def _mos(sym):
     return specs.get(sym, {}).get("vu", 1.0)
 
-# ── orders (short/sell-to-open) ───────────────────────────────────────────────
+# ── orders (long/buy-to-open) ─────────────────────────────────────────────────
 def _open_orders_for_sym(sym: str) -> List[Dict]:
     """Fetch the open-orders list and filter to `sym` client-side.
     The 'symbol' query param is NOT a reliable server-side filter on
@@ -362,8 +407,8 @@ def _open_orders_for_sym(sym: str) -> List[Dict]:
 def _open_ids(sym: str) -> set:
     return {str(o.get("orderId", "")) for o in _open_orders_for_sym(sym)}
 
-def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: float) -> Optional[str]:
-    """Place a limit SHORT (sell-to-open) order for `usd_amount` dollars
+def place_long(sym: str, limit_price: float, sizing_price: float, usd_amount: float) -> Optional[str]:
+    """Place a limit LONG (buy-to-open) order for `usd_amount` dollars
     on `sym` at `limit_price`, sized using `sizing_price` (the price
     used to compute contract count — pass the price the order will
     actually transact at, e.g. limit_price itself for a resting DCA
@@ -374,9 +419,10 @@ def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: f
     Returns order id, 'SKIP' if below minimum size, or None on
     rejection.
 
-    NOTE: side=3 assumes MEXC's contract convention 1=open-long,
+    NOTE: side=1 assumes MEXC's contract convention 1=open-long,
     2=close-short, 3=open-short, 4=close-long — confirmed correct via
-    live test_order_flow.py run (original SP9H-Bot diagnostics).
+    live test_order_flow.py run (original SP9H-Bot / DCA5-Bot
+    diagnostics).
 
     The create-order response's "data" field is a DICT shaped like
     {"orderId": "...", "ts": ...} — the order id must be extracted via
@@ -386,11 +432,11 @@ def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: f
         log.warning(f"[{sym}] size {vol} < min {_mos(sym)} (${usd_amount:.2f}) — order skipped")
         return "SKIP"
     body = {"leverage": LEVERAGE, "openType": 2, "positionMode": 1,
-             "price": _rfmt_price(sym, limit_price), "side": 3,
+             "price": _rfmt_price(sym, limit_price), "side": 1,
              "symbol": sym, "type": 1, "vol": _rfmt_vol(sym, vol)}
     r = mexc("POST", "/api/v1/private/order/create", body=body)
     if not r.get("success"):
-        log.error(f"[{sym}] short order rejected: {r}")
+        log.error(f"[{sym}] long order rejected: {r}")
         return None
 
     data = r.get("data") or {}
@@ -404,7 +450,7 @@ def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: f
         return None
 
     oid = str(oid)
-    log.info(f"[{sym}]  limit SHORT {_rfmt_vol(sym, vol)} @ {_rfmt_price(sym, limit_price)}  "
+    log.info(f"[{sym}]  limit LONG {_rfmt_vol(sym, vol)} @ {_rfmt_price(sym, limit_price)}  "
              f"id={oid}  usd={usd_amount:.2f}  sizing_price={sizing_price:.4f}")
     return oid
 
@@ -428,11 +474,11 @@ def get_mark(sym: str) -> float:
     d = mexc("GET", "/api/v1/contract/ticker", params={"symbol": sym}).get("data") or {}
     return float(d.get("fairPrice", d.get("lastPrice", 0)) or 0)
 
-# ── daily klines + rolling 9d high ────────────────────────────────────────────
+# ── daily klines + rolling 9d low ─────────────────────────────────────────────
 def fetch_daily_bars(sym: str, lookback_days: int) -> List[Dict]:
     """Fetch closed daily candles from MEXC's public futures kline
     endpoint for `sym`. Response 'data' is a dict of parallel arrays
-    keyed by field name. Uses the 'real*' fields (realHigh etc.), which
+    keyed by field name. Uses the 'real*' fields (realLow etc.), which
     reflect actual traded/index price rather than mark-price OHLC.
     Excludes the still-open, unclosed current daily bar."""
     now_s = int(time.time())
@@ -451,38 +497,39 @@ def fetch_daily_bars(sym: str, lookback_days: int) -> List[Dict]:
 
     d = raw.get("data") or {}
     times = d.get("time") or []
-    highs = d.get("realHigh") or d.get("high") or []
+    lows = d.get("realLow") or d.get("low") or []
 
     bars = []
     for i in range(len(times)):
         t_s = int(times[i])
         if t_s + 86400 > now_s:
             continue  # exclude still-open current daily bar
-        bars.append({"t": t_s * 1000, "h": float(highs[i])})
+        bars.append({"t": t_s * 1000, "l": float(lows[i])})
     bars.sort(key=lambda b: b["t"])
     return bars
 
-def rolling_9d_high(sym: str) -> Optional[float]:
-    """Max high of the trailing ROLL_DAYS closed daily bars for `sym`,
+def rolling_9d_low(sym: str) -> Optional[float]:
+    """Min low of the trailing ROLL_DAYS closed daily bars for `sym`,
     including the most recently closed bar. Returns None if fewer than
     ROLL_DAYS closed bars are available — caller must skip the symbol
     for the day rather than substitute a placeholder."""
     bars = fetch_daily_bars(sym, ROLL_DAYS + 3)
     if len(bars) < ROLL_DAYS:
-        log.error(f"[{sym}] only {len(bars)} closed daily bars available, need {ROLL_DAYS} — cannot compute 9d high")
+        log.error(f"[{sym}] only {len(bars)} closed daily bars available, need {ROLL_DAYS} — cannot compute 9d low")
         return None
     window = bars[-ROLL_DAYS:]
-    return max(b["h"] for b in window)
+    return min(b["l"] for b in window)
 
 # ── startup test orders (ALL symbols) ─────────────────────────────────────────
 def run_startup_test_order_for(sym: str):
-    """One-time validation for a single symbol: places a limit SHORT at
-    mark price + 10% (chosen to be unlikely to fill immediately), waits
-    TEST_ORDER_WAIT_SEC, then cancels it if still open. This test is
-    priced deliberately away from mark and is expected NOT to fill —
-    it validates the signing/place/cancel path and this symbol's specs
-    (tick size, min size), not trading logic. Sized using mark (the
-    test order's own dedicated USD amount, unrelated to DCA sizing)."""
+    """One-time validation for a single symbol: places a limit LONG at
+    mark price - 10% (chosen to be unlikely to fill immediately),
+    waits TEST_ORDER_WAIT_SEC, then cancels it if still open. This
+    test is priced deliberately away from mark and is expected NOT to
+    fill — it validates the signing/place/cancel path and this
+    symbol's specs (tick size, min size), not trading logic. Sized
+    using mark (the test order's own dedicated USD amount, unrelated
+    to DCA sizing)."""
     log.info(f"── startup test order [{sym}]: begin ──────────────────")
     try:
         mark = get_mark(sym)
@@ -490,11 +537,11 @@ def run_startup_test_order_for(sym: str):
             log.error(f"[{sym}] test order aborted: invalid mark price ({mark})")
             return
 
-        test_price = mark * TEST_ORDER_PREMIUM
+        test_price = mark * TEST_ORDER_DISCOUNT
         log.info(f"[{sym}] test order: mark={mark:.4f}  limit={test_price:.4f} "
-                 f"(+{(TEST_ORDER_PREMIUM-1)*100:.0f}%)  usd={TEST_ORDER_USD:.2f}")
+                 f"(-{(1-TEST_ORDER_DISCOUNT)*100:.0f}%)  usd={TEST_ORDER_USD:.2f}")
 
-        oid = place_short(sym, test_price, mark, TEST_ORDER_USD)
+        oid = place_long(sym, test_price, mark, TEST_ORDER_USD)
         if oid == "SKIP":
             log.warning(f"[{sym}] test order skipped — below minimum contract size; "
                         f"sizing/signing path could not be fully validated")
@@ -508,7 +555,7 @@ def run_startup_test_order_for(sym: str):
 
         if is_filled(sym, oid):
             log.warning(f"[{sym}] test order id={oid} FILLED during the {TEST_ORDER_WAIT_SEC}s wait — "
-                        f"this is now a real open short position, not a no-op. "
+                        f"this is now a real open long position, not a no-op. "
                         f"No cancellation is possible for a filled order; review your "
                         f"MEXC position manually if this was unexpected.")
         else:
@@ -536,14 +583,16 @@ def run_startup_test_orders():
 
 # ── DCA trigger logic ─────────────────────────────────────────────────────────
 def run_daily_dca(now_utc: datetime.datetime):
-    """For each symbol whose 90-day window includes today and which
-    hasn't already fired today (per persisted fire history), compute
-    the current trailing 9-day high and place a limit SHORT at that
-    price for that day's slice (budget/90), sized using that SAME
-    9d-high price (see place_short docstring / module docstring for
-    why sizing uses the limit price, not mark). Never cancels
-    anything — a prior day's unfilled order is left resting and
-    today's order stacks on top of it."""
+    """For each symbol whose OWN 90-day window includes today and
+    which hasn't already fired today (per persisted fire history),
+    compute the current trailing 9-day low and place a limit LONG at
+    that price for that day's slice (that symbol's own budget / that
+    symbol's own day count), sized using that SAME 9d-low price (see
+    place_long docstring / module docstring for why sizing uses the
+    limit price, not mark). Never cancels anything — a prior day's
+    unfilled order is left resting and today's order stacks on top of
+    it. Each symbol is evaluated fully independently of every other
+    symbol in SYMBOLS."""
     today = now_utc.date()
     for sym in SYMBOLS:
         if not in_dca_window(sym, today):
@@ -557,14 +606,15 @@ def run_daily_dca(now_utc: datetime.datetime):
             log.error(f"[{sym}] DCA: invalid mark price ({mark}) — skipping today, will retry next midnight wake only")
             continue
 
-        target = rolling_9d_high(sym)
+        target = rolling_9d_low(sym)
         if target is None:
-            log.error(f"[{sym}] DCA: could not compute 9d high — skipping today, will retry next midnight wake only")
+            log.error(f"[{sym}] DCA: could not compute 9d low — skipping today, will retry next midnight wake only")
             continue
 
-        log.info(f"[{sym}] DCA fire {today.isoformat()}: limit SHORT ${DCA_DAILY_USD:.2f} "
-                 f"@ 9dHigh={target:.4f} (sized off 9dHigh, not mark={mark:.4f})")
-        oid = place_short(sym, target, target, DCA_DAILY_USD)
+        daily_usd = DCA_DAILY_USD[sym]
+        log.info(f"[{sym}] DCA fire {today.isoformat()}: limit LONG ${daily_usd:.2f} "
+                 f"@ 9dLow={target:.4f} (sized off 9dLow, not mark={mark:.4f})")
+        oid = place_long(sym, target, target, daily_usd)
         if oid == "SKIP":
             log.warning(f"[{sym}] DCA fire skipped — below minimum contract size; NOT marked as fired, will retry next midnight wake")
             continue
@@ -575,11 +625,11 @@ def run_daily_dca(now_utc: datetime.datetime):
         mark_fired(sym, today, {
             "symbol": sym, "date": today.isoformat(), "order_id": oid,
             "limit_price": target, "sizing_price": target, "mark_at_fire": mark,
-            "usd": DCA_DAILY_USD,
+            "usd": daily_usd,
         })
 
-# ── SVG rendering (multi-symbol status table) ─────────────────────────────────
-def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today: datetime.date) -> str:
+# ── SVG rendering (multi-symbol status table) ──────────────────────────────────
+def render_svg(marks: Dict[str, float], lows: Dict[str, Optional[float]], today: datetime.date) -> str:
     W, H = 980, 60 + 26 * len(SYMBOLS)
     now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -589,30 +639,33 @@ def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today
         f'width="100%" style="max-width:{W}px;display:block">',
         f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
         f'<text x="20" y="24" font-family="Courier New" font-size="13" '
-        f'fill="#333" font-weight="bold">DCA5-Bot (priced + sized at 9d high)  {now_str}</text>',
+        f'fill="#333" font-weight="bold">MultiLongDCA-Bot (each symbol priced + sized at its own 9d low)  {now_str}</text>',
     ]
 
     y = 50
     for sym in SYMBOLS:
         mark = marks.get(sym, 0.0)
-        high = highs.get(sym)
-        high_str = f"{high:,.4f}" if high is not None else "n/a"
+        low = lows.get(sym)
+        low_str = f"{low:,.4f}" if low is not None else "n/a"
         start = DCA_START_DATE[sym]
-        end = start + datetime.timedelta(days=DCA_DAYS - 1)
+        days = DCA_DAYS[sym]
+        budget = DCA_BUDGET_USD[sym]
+        daily = DCA_DAILY_USD[sym]
+        end = start + datetime.timedelta(days=days - 1)
         n_fired = fired_count(sym)
         active = in_dca_window(sym, today)
         fired_today = has_fired_today(sym, today)
-        remaining_usd = max(0.0, DCA_BUDGET_USD - n_fired * DCA_DAILY_USD)
+        remaining_usd = max(0.0, budget - n_fired * daily)
 
         if today < start:
             phase = f"not started (begins {start.isoformat()})"
         elif today > end:
             phase = f"window complete ({end.isoformat()})"
         else:
-            phase = f"day {(today - start).days + 1}/{DCA_DAYS}" + (" — fired today" if fired_today else " — pending today" if active else "")
+            phase = f"day {(today - start).days + 1}/{days}" + (" — fired today" if fired_today else " — pending today" if active else "")
 
-        clr = "#1a8a1a" if fired_today else ("#aa1111" if active else "#888")
-        line = (f"{sym:<14} mark={mark:>12,.4f}  9dHigh={high_str:>12}   fired={n_fired:>3}/{DCA_DAYS}   "
+        clr = "#1a8a1a" if fired_today else ("#1155cc" if active else "#888")
+        line = (f"{sym:<14} mark={mark:>12,.4f}  9dLow={low_str:>12}   fired={n_fired:>3}/{days}   "
                 f"remaining=${remaining_usd:>8,.2f}   {phase}")
         svg.append(f'<text x="20" y="{y}" font-family="Courier New" font-size="11" '
                    f'fill="{clr}">{line}</text>')
@@ -629,12 +682,12 @@ def _seconds_until_next_hour() -> float:
 def engine_cycle():
     now_utc = datetime.datetime.now(UTC)
     marks = {sym: get_mark(sym) for sym in SYMBOLS}
-    highs = {sym: rolling_9d_high(sym) for sym in SYMBOLS}
+    lows = {sym: rolling_9d_low(sym) for sym in SYMBOLS}
 
     if now_utc.hour == 0:
         run_daily_dca(now_utc)
 
-    svg = render_svg(marks, highs, now_utc.date())
+    svg = render_svg(marks, lows, now_utc.date())
     STATE.set_svg(svg)
     n_fired_total = sum(len(v) for v in STATE_DATA["fired"].values())
     STATE.set_status(f"ok  {now_utc.strftime('%Y-%m-%d %H:%M UTC')}  total_fires={n_fired_total}")
@@ -685,11 +738,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             html = (
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta http-equiv='refresh' content='300'>"
-                "<title>DCA5-Bot Overview</title>"
+                "<title>MultiLongDCA-Bot Overview</title>"
                 "<style>body{font-family:monospace;background:#fafafa;margin:24px}"
                 "img{max-width:100%;height:auto;border:1px solid #ccc}</style>"
                 "</head><body>"
-                "<h3>DCA5-Bot — 90-Day DCA Short Bot (priced + sized at 9d high)</h3>"
+                "<h3>MultiLongDCA-Bot — Multi-Symbol DCA Long Bot (each priced + sized at its own 9d low)</h3>"
                 f"<p>status: {status}</p>"
                 "<img src='/chart.svg' alt='overview table'/>"
                 "<p><a href='/orders.json'>order records (JSON)</a></p>"
