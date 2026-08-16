@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 MultiLongDCA-Bot — Multi-Symbol (USOIL_USDT WTI Crude +
-UKOIL_USDT Brent Crude) DCA Long Bot, each symbol priced and sized
-independently at its own rolling 9-day low, each with its own
+UKOIL_USDT Brent Crude + SPCX_USDT) DCA Long Bot, each symbol priced and
+sized independently at its own rolling 9-day low, each with its own
 independent budget and window.
 
 Single-process, single-machine bot for Fly.io.
@@ -22,7 +22,7 @@ Behavior:
     symbol's test is independent — one symbol failing its test does
     not stop the others from being tested or stop the engine loop
     from starting afterward. This adds ~len(SYMBOLS) x
-    TEST_ORDER_WAIT_SEC to startup time (currently ~2 minutes for 2
+    TEST_ORDER_WAIT_SEC to startup time (currently ~3 minutes for 3
     symbols at 60s each).
 
   - Every hour on the hour: refresh mark prices + rolling 9d lows
@@ -39,9 +39,10 @@ Behavior:
 
     Each symbol's daily slice is computed from ITS OWN budget and day
     count (DCA_BUDGET_USD[sym] / DCA_DAYS[sym]), not a shared pool —
-    two symbols can in principle run different budgets or different
-    windows without restructuring the code, though both are currently
-    configured identically ($1000 / 90 days / starting 2026-08-10).
+    symbols can in principle run different budgets or different
+    windows without restructuring the code, though all three are
+    currently configured identically ($1000 / 90 days / starting
+    2026-08-10).
 
     Sizing uses the 9d-low price (the limit price itself), NOT mark.
 
@@ -98,8 +99,9 @@ Environment (secrets only, not behavior):
 SYMBOLS:
   USOIL_USDT  - WTI Crude Oil
   UKOIL_USDT  - Brent Crude Oil
+  SPCX_USDT   - SPCX
 
-The two symbols are treated completely independently.
+All symbols are treated completely independently.
 
 IMPORTANT:
   Contract specifications are fetched live from MEXC at startup.
@@ -145,12 +147,14 @@ MEXC_BASE   = "https://api.mexc.co"
 #
 # USOIL_USDT = WTI Crude Oil
 # UKOIL_USDT = Brent Crude Oil
+# SPCX_USDT  = SPCX
 #
 # Each symbol is completely independent.
 
 SYMBOLS = [
     "USOIL_USDT",
     "UKOIL_USDT",
+    "SPCX_USDT",
 ]
 
 
@@ -163,9 +167,9 @@ ROLL_DAYS = 9
 # Each symbol has its OWN independent budget and day count.
 #
 # Current configuration:
-#   WTI Brent:
 #   USOIL_USDT  = $1000 / 90 days
 #   UKOIL_USDT  = $1000 / 90 days
+#   SPCX_USDT   = $1000 / 90 days
 #
 # The dictionaries deliberately remain per-symbol so the schedules
 # can diverge later without restructuring the code.
@@ -173,12 +177,14 @@ ROLL_DAYS = 9
 DCA_BUDGET_USD: Dict[str, float] = {
     "USOIL_USDT": 1000.0,
     "UKOIL_USDT": 1000.0,
+    "SPCX_USDT": 1000.0,
 }
 
 
 DCA_DAYS: Dict[str, int] = {
     "USOIL_USDT": 90,
     "UKOIL_USDT": 90,
+    "SPCX_USDT": 90,
 }
 
 
@@ -190,11 +196,12 @@ DCA_DAILY_USD: Dict[str, float] = {
 
 # ── per-symbol DCA start dates ────────────────────────────────────────────────
 #
-# Both currently start on 2026-08-10.
+# All three currently start on 2026-08-10.
 
 DCA_START_DATE: Dict[str, datetime.date] = {
     "USOIL_USDT": datetime.date(2026, 8, 10),
     "UKOIL_USDT": datetime.date(2026, 8, 10),
+    "SPCX_USDT": datetime.date(2026, 8, 10),
 }
 
 
@@ -293,7 +300,8 @@ def load_state() -> Dict:
         {
             "fired": {
                 "USOIL_USDT": ["2026-08-10", ...],
-                "UKOIL_USDT": ["2026-08-10", ...]
+                "UKOIL_USDT": ["2026-08-10", ...],
+                "SPCX_USDT": ["2026-08-10", ...]
             },
             "orders": [...]
         }
@@ -1340,7 +1348,7 @@ def render_svg(
             f'font-size="13" '
             f'fill="#333" '
             f'font-weight="bold">'
-            f'MultiLongDCA-Bot — WTI + Brent — '
+            f'MultiLongDCA-Bot — WTI + Brent + SPCX — '
             f'own 9d-low pricing/sizing — {now_str}'
             f'</text>'
         ),
@@ -1471,7 +1479,7 @@ def _seconds_until_next_hour() -> float:
     )
 
 
-# ── engine cycle ──────────────────────────────────────────────────────────────
+# ── engine cycle ─────────────────────────────────────────────────────────────
 
 def engine_cycle():
 
@@ -1659,7 +1667,7 @@ class Handler(
                 "<body>"
                 "<h3>"
                 "MultiLongDCA-Bot — "
-                "WTI + Brent Multi-Symbol "
+                "WTI + Brent + SPCX Multi-Symbol "
                 "DCA Long Bot"
                 "</h3>"
                 f"<p>status: {status}</p>"
