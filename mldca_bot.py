@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MultiLongDCA-Bot — Multi-Symbol (USOIL_USDT WTI Crude +
-UKOIL_USDT Brent Crude + SPCX_USDT) DCA Long Bot, each symbol priced and
+UKOIL_USDT Brent Crude + SPCXSTOCK_USDT) DCA Long Bot, each symbol priced and
 sized independently at its own rolling 9-day low, each with its own
 independent budget and window.
 
@@ -97,8 +97,8 @@ Environment (secrets only, not behavior):
   MEXCSECRET  - MEXC API secret
 
 SYMBOLS:
-  USOIL_USDT  - WTI Crude Oil
-  UKOIL_USDT  - Brent Crude Oil
+  USOIL_USDT       - WTI Crude Oil
+  UKOIL_USDT       - Brent Crude Oil
   SPCXSTOCK_USDT   - SPCX
 
 All symbols are treated completely independently.
@@ -145,9 +145,9 @@ MEXC_BASE   = "https://api.mexc.co"
 
 # ── symbols ────────────────────────────────────────────────────────────────────
 #
-# USOIL_USDT = WTI Crude Oil
-# UKOIL_USDT = Brent Crude Oil
-# SPCX_USDT  = SPCX
+# USOIL_USDT      = WTI Crude Oil
+# UKOIL_USDT      = Brent Crude Oil
+# SPCXSTOCK_USDT  = SPCX
 #
 # Each symbol is completely independent.
 
@@ -167,9 +167,9 @@ ROLL_DAYS = 9
 # Each symbol has its OWN independent budget and day count.
 #
 # Current configuration:
-#   USOIL_USDT  = $1000 / 90 days
-#   UKOIL_USDT  = $1000 / 90 days
-#   SPCX_USDT   = $1000 / 90 days
+#   USOIL_USDT      = $1000 / 90 days
+#   UKOIL_USDT      = $1000 / 90 days
+#   SPCXSTOCK_USDT  = $1000 / 90 days
 #
 # The dictionaries deliberately remain per-symbol so the schedules
 # can diverge later without restructuring the code.
@@ -201,7 +201,7 @@ DCA_DAILY_USD: Dict[str, float] = {
 DCA_START_DATE: Dict[str, datetime.date] = {
     "USOIL_USDT": datetime.date(2026, 8, 10),
     "UKOIL_USDT": datetime.date(2026, 8, 10),
-    "SPCX_USDT": datetime.date(2026, 8, 10),
+    "SPCXSTOCK_USDT": datetime.date(2026, 8, 10),
 }
 
 
@@ -301,7 +301,7 @@ def load_state() -> Dict:
             "fired": {
                 "USOIL_USDT": ["2026-08-10", ...],
                 "UKOIL_USDT": ["2026-08-10", ...],
-                "SPCX_USDT": ["2026-08-10", ...]
+                "SPCXSTOCK_USDT": ["2026-08-10", ...]
             },
             "orders": [...]
         }
@@ -1440,7 +1440,7 @@ def render_svg(
         )
 
         line = (
-            f"{sym:<14} "
+            f"{sym:<16} "
             f"mark={mark:>12,.4f}  "
             f"9dLow={low_str:>12}   "
             f"fired={n_fired:>3}/{days}   "
