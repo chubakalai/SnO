@@ -155,6 +155,9 @@ SYMBOLS = [
     "USOIL_USDT",
     "UKOIL_USDT",
     "SPCXSTOCK_USDT",
+    "COPPER_USDT",
+    "SILVER_USDT",
+    "XAU_USDT",
 ]
 
 
@@ -178,6 +181,9 @@ DCA_BUDGET_USD: Dict[str, float] = {
     "USOIL_USDT": 1000.0,
     "UKOIL_USDT": 1000.0,
     "SPCXSTOCK_USDT": 1000.0,
+    "COPPER_USDT": 1000.0,
+    "SILVER_USDT": 1000.0,
+    "XAU_USDT": 1000.0,
 }
 
 
@@ -185,6 +191,9 @@ DCA_DAYS: Dict[str, int] = {
     "USOIL_USDT": 90,
     "UKOIL_USDT": 90,
     "SPCXSTOCK_USDT": 90,
+    "COPPER_USDT": 90,
+    "SILVER_USDT": 90,
+    "XAU_USDT": 90,
 }
 
 
@@ -202,6 +211,9 @@ DCA_START_DATE: Dict[str, datetime.date] = {
     "USOIL_USDT": datetime.date(2026, 8, 10),
     "UKOIL_USDT": datetime.date(2026, 8, 10),
     "SPCXSTOCK_USDT": datetime.date(2026, 8, 10),
+    "COPPER_USDT": datetime.date(2026, 8, 10),
+    "SILVER_USDT": datetime.date(2026, 8, 10),
+    "XAU_USDT": datetime.date(2026, 8, 10),
 }
 
 
