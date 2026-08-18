@@ -154,7 +154,7 @@ MEXC_BASE   = "https://api.mexc.co"
 SYMBOLS = [
     "USOIL_USDT",
     "UKOIL_USDT",
-    "SPCX_USDT",
+    "SPCXSTOCK_USDT",
 ]
 
 
