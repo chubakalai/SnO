@@ -99,7 +99,7 @@ Environment (secrets only, not behavior):
 SYMBOLS:
   USOIL_USDT  - WTI Crude Oil
   UKOIL_USDT  - Brent Crude Oil
-  SPCX_USDT   - SPCX
+  SPCXSTOCK_USDT   - SPCX
 
 All symbols are treated completely independently.
 
@@ -177,14 +177,14 @@ ROLL_DAYS = 9
 DCA_BUDGET_USD: Dict[str, float] = {
     "USOIL_USDT": 1000.0,
     "UKOIL_USDT": 1000.0,
-    "SPCX_USDT": 1000.0,
+    "SPCXSTOCK_USDT": 1000.0,
 }
 
 
 DCA_DAYS: Dict[str, int] = {
     "USOIL_USDT": 90,
     "UKOIL_USDT": 90,
-    "SPCX_USDT": 90,
+    "SPCXSTOCK_USDT": 90,
 }
 
 
