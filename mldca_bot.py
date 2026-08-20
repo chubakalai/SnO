@@ -172,6 +172,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.sax.saxutils as _saxutils
 from typing import Deque, Dict, List, Optional
 
 try:
@@ -272,6 +273,15 @@ TEST_ORDER_WAIT_SEC = 20
 FAILED_SYMBOLS: set = set()
 _FAILED_LOCK = threading.Lock()
 
+
+def _xml_escape(s: str) -> str:
+    """
+    Escapes text for safe embedding inside SVG/XML text content.
+    Handles &, <, > (and quotes, harmless extra safety) so that any
+    dynamic string — symbol names, formatted numbers, log-derived
+    text — can never break XML parsing.
+    """
+    return _saxutils.escape(str(s))
 
 def flag_failed(sym: str, reason: str):
 
@@ -2107,6 +2117,11 @@ def render_svg(now_utc: datetime.datetime) -> str:
 
     now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    title_text = _xml_escape(
+        f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
+        f'minute-trigger engine — {now_str}'
+    )
+
     svg = [
 
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -2126,8 +2141,7 @@ def render_svg(now_utc: datetime.datetime) -> str:
             f'font-size="13" '
             f'fill="#333" '
             f'font-weight="bold">'
-            f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
-            f'minute-trigger engine — {now_str}'
+            f'{title_text}'
             f'</text>'
         ),
     ]
@@ -2187,7 +2201,7 @@ def render_svg(now_utc: datetime.datetime) -> str:
             f'font-family="Courier New" '
             f'font-size="11" '
             f'fill="{clr}">'
-            f'{line}'
+            f'{_xml_escape(line)}'
             f'</text>'
         )
 
@@ -2268,8 +2282,14 @@ def render_symbol_chart_svg(sym: str) -> str:
 
     now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
-    title_suffix = " [FAILED — excluded from trading]" if failed else ""
+    title_suffix = _xml_escape(
+        " [FAILED — excluded from trading]" if failed else ""
+    )
 
+    chart_title = _xml_escape(
+        f'{sym} — 10d, 15m candles — {now_str}'
+    ) + title_suffix
+  
     svg = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         (
@@ -2292,9 +2312,10 @@ def render_symbol_chart_svg(sym: str) -> str:
         y = y_of(price)
 
         svg.append(
-            f'<line x1="{CHART_MARGIN_L}" y1="{y:.1f}" '
-            f'x2="{CHART_W - CHART_MARGIN_R}" y2="{y:.1f}" '
-            f'stroke="#e0e0e0" stroke-width="1"/>'
+            f'<text x="{CHART_W - CHART_MARGIN_R - 4}" y="{ry - 4:.1f}" '
+            f'font-family="Courier New" font-size="10" '
+            f'fill="#cc0000" text-anchor="end">'
+            f'{_xml_escape(f"{ref_label} low threshold: {ref_low:,.4f}")}</text>'
         )
 
         svg.append(
