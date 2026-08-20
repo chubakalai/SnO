@@ -1,22 +1,84 @@
 #!/usr/bin/env python3
 """
-MultiLongDCA-Bot — Multi-Symbol DCA Long Bot, each symbol priced and
-sized independently at its own rolling 9-day low, each with its own
-independent budget and window.
+MultiLongDCA-Bot — Multi-Symbol Minute-Trigger DCA Long Bot.
+
+Every symbol is priced and sized independently. Instead of firing
+once a day at a fixed daily slice, this engine checks EVERY MINUTE
+(at :01 past the minute) whether the most recently closed 1-minute
+candle's low is a new rolling low over a reference window, and if
+so stacks a $1 trigger toward that symbol's pending order.
 
 Single-process, single-machine bot for Fly.io.
 
-This is a multi-symbol extension of OilLongDCA-Bot. Every symbol
-in SYMBOLS is treated fully independently: its own budget, its own
-window, its own fire history, its own 9-day-low computation.
-Nothing is pooled or shared across symbols except the process, the
-HTTP status server, and the state file.
+Symbols are configured in one place — SYMBOL_CONFIG, near the top
+of this file. To add or remove a symbol, only edit SYMBOL_CONFIG.
 
-Symbols and their DCA parameters (budget / days / start date) are
-configured in one place — SYMBOL_CONFIG, near the top of this file.
-To add or remove a symbol, only edit SYMBOL_CONFIG.
+═══════════════════════════════════════════════════════════════════
+MINUTE-TRIGGER ENGINE (replaces the old fixed daily-budget DCA)
+═══════════════════════════════════════════════════════════════════
 
-Behavior:
+Per-symbol running budget:
+  - Starts at $0.
+  - At every UTC midnight, a flat +$10 is added to the symbol's
+    running budget (accrual, not a fixed pool — this replaces the
+    old $1000 / 90-day budget entirely).
+  - Every time a real order is placed for a symbol, its USD amount
+    is subtracted from that symbol's running budget. The budget can
+    go negative.
+
+Per-minute check (runs once per minute, at :01 past the minute, for
+every non-failed symbol independently):
+  1. Look at the most recently CLOSED 1-minute candle (the one that
+     just ended before this minute began — never the still-forming
+     candle).
+  2. Choose the reference window based on the symbol's CURRENT
+     running budget at the moment of the check:
+       - budget >= 0  -> reference is the rolling 2-day low
+       - budget <  0  -> reference is the rolling 9-day low
+     Both are computed from the trailing window of closed 1-minute
+     candles (2 days = 2880 minutes, 9 days = 12960 minutes).
+  3. If the closed candle's low is <= that reference low (i.e. it
+     ties or sets a new low over the chosen window), it is a
+     TRIGGER.
+  4. On trigger: add $1 to the symbol's pending accumulator.
+  5. If the accumulator's contract-equivalent at the triggering
+     candle's low price is >= the exchange's minimum order size for
+     that symbol, a real limit LONG is placed:
+       - price = exactly the triggering candle's low (no discount)
+       - USD amount = the full accumulated pending balance
+     The accumulator resets to 0, and the placed USD amount is
+     subtracted from the symbol's running budget.
+     If the accumulator is still below the minimum order size, no
+     order is placed and the accumulator carries forward untouched
+     to the next trigger.
+
+Rolling 1-minute candle buffer (per symbol):
+  - Refetching 9 days of 1-minute candles (12,960 candles) every
+    single minute, for every symbol, would be wasteful and could
+    trip exchange rate limits. Instead each symbol keeps an
+    in-memory rolling buffer of its own closed 1-minute candles:
+      - Seeded ONCE at startup with a full ~9-day history fetch.
+      - Updated every minute by fetching only the 1-2 most recently
+        closed candles and appending them (candles older than 9
+        days are dropped from the buffer).
+  - The 2d-low and 9d-low are both computed as a plain min() over a
+    suffix of this same buffer (last 2880 / last 12960 minutes) —
+    no repeated bulk refetching.
+
+Failed symbols (see startup test orders, below) are fully frozen:
+they accrue no budget, and the minute-check does not run for them
+at all, for the remainder of this process's lifetime.
+
+All budget / accumulator / rolling-buffer state is persisted to the
+local JSON state file, so a restart resumes correctly rather than
+re-triggering everything (though the 1-minute buffer itself is
+always re-seeded fresh from MEXC at startup, since it's a derived
+cache, not authoritative history).
+
+═══════════════════════════════════════════════════════════════════
+STARTUP TEST ORDERS (unchanged in spirit from prior versions)
+═══════════════════════════════════════════════════════════════════
+
   - On startup: run a one-time TEST order (limit LONG at market-10%,
     sized at that symbol's own exchange-reported minimum order size)
     against EVERY symbol in SYMBOLS, in three flat batch phases
@@ -32,87 +94,11 @@ Behavior:
     ANY failure at any phase — invalid/zero mark price, a rejected
     order, a failed cancel, or any exception — flags that symbol as
     FAILED for the remainder of this process's lifetime: it is
-    excluded from the daily DCA engine and shown in a visually
-    distinct flagged state on the SVG status page. A symbol whose
-    test order fills during the wait is NOT a failure — that's a
-    real open position, logged as such, and the symbol remains
-    validated and continues trading.
-
-    Total startup delay is roughly TEST_ORDER_WAIT_SEC plus the time
-    to fire off 2 x len(SYMBOLS) sequential HTTP requests — much
-    less than testing symbols one-at-a-time with a full wait each.
-
-  - Every hour on the hour: refresh mark prices + rolling 9d lows
-    for all non-failed symbols and refresh the in-memory SVG status
-    table (failed symbols are still shown, flagged, with no
-    mark/low refreshed).
-
-  - Only at hour == 00 UTC: for each symbol NOT flagged failed, if
-    today's calendar date falls within THAT SYMBOL'S OWN DCA window
-    (per-symbol start dates in SYMBOL_CONFIG) AND that symbol has
-    not already fired today (per persisted fire-history), place a
-    limit LONG priced AND SIZED at that symbol's current trailing
-    9-day low (including today's not-yet-closed bar via the daily
-    klines fetch — see rolling_9d_low) for that day's slice (that
-    symbol's own budget / that symbol's own DCA_DAYS).
-
-    Each symbol's daily slice is computed from ITS OWN budget and day
-    count (DCA_BUDGET_USD[sym] / DCA_DAYS[sym]), not a shared pool —
-    symbols can run different budgets or different windows without
-    restructuring the code.
-
-    Sizing uses the 9d-low price (the limit price itself), NOT mark.
-
-    Reasoning: a resting limit long fills at its limit price or
-    better. The 9d-low is therefore the price this order is intended
-    to transact at if it fills. Sizing off mark while pricing off the
-    9d-low would make the filled notional smaller than the intended
-    daily dollar slice. Sizing off the 9d-low itself makes the
-    notional-at-fill approximately equal to the daily slice amount.
-
-    Mark is still fetched and logged for visibility/context, just not
-    used for DCA sizing.
-
-    The order is left open with no timeout — if a previous day's
-    order for that symbol is still unfilled, it is left resting and
-    a new order is placed on top of it (orders stack; nothing is ever
-    cancelled by the daily engine).
-
-  - Pricing every day's DCA slice at the rolling 9d low rather than
-    at mark is deliberate: it reaches for a better-than-market long
-    entry every day and naturally scales with each symbol's own
-    volatility.
-
-    The tradeoff is that in a sustained downtrend the 9d low chases
-    price downward and fills may not be much better than mark, while
-    resting orders may take a long time or never fill.
-
-  - If a symbol's daily klines can't be fetched or return fewer than
-    ROLL_DAYS closed bars on a given midnight wake, that symbol is
-    skipped for the day (not fired, not marked as fired) rather than
-    falling back to any placeholder price. It will be retried at the
-    next midnight wake.
-
-  - A restart cannot double-fire a given symbol on a given UTC date:
-    fire history (symbol -> list of ISO dates already fired) is
-    persisted to a local JSON file and checked before every fire.
-
-  - A restart also reruns the full startup test-order suite for
-    every symbol, including ones that failed before — FAILED_SYMBOLS
-    is in-memory only and is not persisted, so a symbol that failed
-    due to a transient issue can recover on the next restart.
-
-  - Every placed order is logged (id, symbol, price, usd, contracts)
-    and recorded into the same local JSON state file alongside fire
-    history, so open orders can be cross-checked against MEXC's
-    open-orders API at any time (see / status page, /orders.json,
-    /failed.json, and logs).
-
-No CLI arguments. No config files beyond the state file (which stores
-history/records, not config). No web UI for configuration. All
-parameters are hardcoded constants below. A second thread runs a
-small public HTTP server that exposes the current status table as an
-SVG and a minimal HTML wrapper page.
+    excluded from the minute-trigger engine entirely (no budget
+    accrual, no candle checks) and shown in a visually distinct
+    flagged state on the SVG status page. A symbol whose test order
+    fills during the wait is NOT a failure — that's a real position,
+    logged as such, and the symbol remains validated.
 
 Environment (secrets only, not behavior):
   MEXC        - MEXC API key
@@ -121,13 +107,9 @@ Environment (secrets only, not behavior):
 IMPORTANT:
   Contract specifications are fetched live from MEXC at startup.
   The bot does not hardcode priceUnit, volUnit, or contractSize.
-
-  The daily kline response is expected to expose parallel arrays
-  including 'time' and 'realLow'/'low'. The bot excludes the current
-  still-open daily candle and calculates the minimum low over the
-  latest ROLL_DAYS closed candles.
 """
 
+import collections
 import datetime
 import hashlib
 import hmac
@@ -140,7 +122,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -160,20 +142,14 @@ MEXC_BASE   = "https://api.mexc.co"
 
 # ── symbol configuration ──────────────────────────────────────────────────────
 #
-# Single source of truth for which symbols the bot trades and each
-# symbol's own independent DCA parameters. To add or remove a symbol,
-# only edit SYMBOL_CONFIG below — nothing else in the file needs to
-# change.
+# Single source of truth for which symbols the bot trades. To add or
+# remove a symbol, only edit SYMBOLS below — nothing else in the
+# file needs to change.
 #
-# Each symbol is completely independent: its own budget, its own
-# window, its own fire history, its own 9-day-low computation.
-# Nothing is pooled or shared across symbols except the process, the
-# HTTP status server, and the state file.
-#
-# Fields:
-#   budget_usd  - total USD to deploy over the window
-#   days        - length of the DCA window, in days
-#   start_date  - first calendar date (UTC) eligible to fire
+# There is no per-symbol budget/window configuration anymore: every
+# symbol starts its running budget at $0 and accrues +$10 at every
+# UTC midnight (see BUDGET_DAILY_ACCRUAL_USD below). All symbols are
+# fully independent from each other.
 #
 # USOIL_USDT     = WTI Crude Oil
 # UKOIL_USDT     = Brent Crude Oil
@@ -183,73 +159,32 @@ MEXC_BASE   = "https://api.mexc.co"
 # XAU_USDT       = Gold
 # URNM_USDT      = Uranium
 
-SYMBOL_CONFIG: Dict[str, Dict] = {
-    "USOIL_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-    "UKOIL_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-    "SPCXSTOCK_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-    "COPPER_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-    "SILVER_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-    "XAU_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-    "URNM_USDT": {
-        "budget_usd": 1000.0,
-        "days": 90,
-        "start_date": datetime.date(2026, 8, 10),
-    },
-}
+SYMBOLS: List[str] = [
+    "USOIL_USDT",
+    "UKOIL_USDT",
+    "SPCXSTOCK_USDT",
+    "COPPER_USDT",
+    "SILVER_USDT",
+    "XAU_USDT",
+    "URNM_USDT",
+]
 
-# Derived — do not edit directly. Change SYMBOL_CONFIG instead.
-SYMBOLS: List[str] = list(SYMBOL_CONFIG.keys())
-
-DCA_BUDGET_USD: Dict[str, float] = {
-    sym: cfg["budget_usd"] for sym, cfg in SYMBOL_CONFIG.items()
-}
-
-DCA_DAYS: Dict[str, int] = {
-    sym: cfg["days"] for sym, cfg in SYMBOL_CONFIG.items()
-}
-
-DCA_START_DATE: Dict[str, datetime.date] = {
-    sym: cfg["start_date"] for sym, cfg in SYMBOL_CONFIG.items()
-}
-
-DCA_DAILY_USD: Dict[str, float] = {
-    sym: DCA_BUDGET_USD[sym] / DCA_DAYS[sym]
-    for sym in SYMBOLS
-}
+LEVERAGE = 30
 
 
-def in_dca_window(sym: str, d: datetime.date) -> bool:
-    start = DCA_START_DATE[sym]
-    end = start + datetime.timedelta(days=DCA_DAYS[sym] - 1)
-    return start <= d <= end
+# ── minute-trigger engine constants ───────────────────────────────────────────
 
+BUDGET_DAILY_ACCRUAL_USD = 10.0      # added to running budget at every UTC midnight
+TRIGGER_STACK_USD        = 1.0       # added to accumulator per trigger
 
-LEVERAGE  = 30
-ROLL_DAYS = 9
+ROLL_MINUTES_SHORT = 2 * 24 * 60     # 2 days, in minutes -> "2d low"
+ROLL_MINUTES_LONG  = 9 * 24 * 60     # 9 days, in minutes -> "9d low"
+
+# Buffer keeps a little extra beyond the longest window so trimming
+# has slack and we're never exactly on the edge of insufficient data.
+BUFFER_MAX_MINUTES = ROLL_MINUTES_LONG + 60
+
+MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 
 
 # ── timing ────────────────────────────────────────────────────────────────────
@@ -272,7 +207,8 @@ TEST_ORDER_WAIT_SEC = 20
 # ── failed-symbol tracking ────────────────────────────────────────────────────
 #
 # Populated during startup test orders. Any symbol in this set is
-# excluded from the DCA engine and rendering treats it as flagged,
+# fully frozen — excluded from the minute-trigger engine (no budget
+# accrual, no candle checks) — and rendering treats it as flagged,
 # for the remainder of this process's lifetime. Resets on restart
 # (the whole test suite reruns on every startup).
 
@@ -287,7 +223,7 @@ def flag_failed(sym: str, reason: str):
 
     log.error(
         f"[{sym}] FLAGGED FAILED — {reason} — "
-        "excluded from DCA engine"
+        "excluded from minute-trigger engine"
     )
 
 
@@ -359,31 +295,29 @@ STATE = SharedState()
 
 
 # ── persisted state ──────────────────────────────────────────────────────────
+#
+# {
+#   "orders": [...],
+#   "budget": {"USOIL_USDT": 3.50, ...},        running budget, USD
+#   "accumulator": {"USOIL_USDT": 0.0, ...},     pending stacked $, USD
+#   "last_accrual_date": {"USOIL_USDT": "2026-08-20", ...},
+#   "last_seen_minute": {"USOIL_USDT": "2026-08-20T14:07:00+00:00", ...}
+# }
+#
+# "last_seen_minute" prevents double-processing the same closed
+# candle across restarts / repeated cycles.
 
 def _default_state() -> Dict:
     return {
-        "fired": {},
-        "orders": []
+        "orders": [],
+        "budget": {},
+        "accumulator": {},
+        "last_accrual_date": {},
+        "last_seen_minute": {},
     }
 
 
 def load_state() -> Dict:
-    """
-    Load:
-
-        {
-            "fired": {
-                "USOIL_USDT": ["2026-08-10", ...],
-                "UKOIL_USDT": ["2026-08-10", ...],
-                ...
-            },
-            "orders": [...]
-        }
-
-    from STATE_FILE.
-
-    Missing or corrupt file -> fresh empty state.
-    """
 
     try:
 
@@ -393,8 +327,10 @@ def load_state() -> Dict:
         if not isinstance(data, dict):
             raise ValueError("state file did not contain a dict")
 
-        data.setdefault("fired", {})
-        data.setdefault("orders", [])
+        defaults = _default_state()
+
+        for k, v in defaults.items():
+            data.setdefault(k, v)
 
         return data
 
@@ -443,51 +379,151 @@ STATE_DATA: Dict = load_state()
 _STATE_DATA_LOCK = threading.Lock()
 
 
-def has_fired_today(
-    sym: str,
-    d: datetime.date
-) -> bool:
+def get_budget(sym: str) -> float:
 
-    return d.isoformat() in STATE_DATA["fired"].get(sym, [])
+    return float(
+        STATE_DATA["budget"].get(sym, 0.0)
+    )
 
 
-def mark_fired(
-    sym: str,
-    d: datetime.date,
-    order_record: Dict
-):
+def get_accumulator(sym: str) -> float:
+
+    return float(
+        STATE_DATA["accumulator"].get(sym, 0.0)
+    )
+
+
+def get_last_accrual_date(sym: str) -> Optional[datetime.date]:
+
+    s = STATE_DATA["last_accrual_date"].get(sym)
+
+    if not s:
+        return None
+
+    try:
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def get_last_seen_minute(sym: str) -> Optional[datetime.datetime]:
+
+    s = STATE_DATA["last_seen_minute"].get(sym)
+
+    if not s:
+        return None
+
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _persist():
+
+    save_state(STATE_DATA)
+
+
+def accrue_daily_budget_if_due(sym: str, today: datetime.date):
+
+    """
+    Adds BUDGET_DAILY_ACCRUAL_USD to sym's running budget once per
+    UTC calendar date. Safe to call every minute — only actually
+    accrues the first time it's called on a new date.
+    """
 
     with _STATE_DATA_LOCK:
 
-        STATE_DATA["fired"].setdefault(sym, []).append(
-            d.isoformat()
+        last = get_last_accrual_date(sym)
+
+        if last == today:
+            return
+
+        prev_budget = get_budget(sym)
+
+        new_budget = prev_budget + BUDGET_DAILY_ACCRUAL_USD
+
+        STATE_DATA["budget"][sym] = new_budget
+
+        STATE_DATA["last_accrual_date"][sym] = today.isoformat()
+
+        _persist()
+
+        log.info(
+            f"[{sym}] daily budget accrual: "
+            f"{prev_budget:.2f} + {BUDGET_DAILY_ACCRUAL_USD:.2f} "
+            f"= {new_budget:.2f}"
         )
 
-        STATE_DATA["orders"].append(order_record)
 
-        save_state(STATE_DATA)
-
-
-def record_order_only(order_record: Dict):
+def add_trigger_dollar(sym: str) -> float:
 
     """
-    Record an order (e.g. a startup test order that filled) into
-    the state file's order log without marking any symbol as fired
-    for DCA purposes.
+    Adds TRIGGER_STACK_USD to sym's accumulator and persists.
+    Returns the new accumulator value.
     """
+
+    with _STATE_DATA_LOCK:
+
+        prev = get_accumulator(sym)
+
+        new = prev + TRIGGER_STACK_USD
+
+        STATE_DATA["accumulator"][sym] = new
+
+        _persist()
+
+        return new
+
+
+def reset_accumulator(sym: str):
+
+    with _STATE_DATA_LOCK:
+
+        STATE_DATA["accumulator"][sym] = 0.0
+
+        _persist()
+
+
+def spend_budget(sym: str, usd: float):
+
+    with _STATE_DATA_LOCK:
+
+        prev = get_budget(sym)
+
+        new = prev - usd
+
+        STATE_DATA["budget"][sym] = new
+
+        _persist()
+
+        log.info(
+            f"[{sym}] budget spent ${usd:.2f}: "
+            f"{prev:.2f} -> {new:.2f}"
+        )
+
+
+def set_last_seen_minute(sym: str, minute_dt: datetime.datetime):
+
+    with _STATE_DATA_LOCK:
+
+        STATE_DATA["last_seen_minute"][sym] = minute_dt.isoformat()
+
+        _persist()
+
+
+def record_order(order_record: Dict):
 
     with _STATE_DATA_LOCK:
 
         STATE_DATA["orders"].append(order_record)
 
-        save_state(STATE_DATA)
+        _persist()
 
 
-def fired_count(sym: str) -> int:
+def total_orders_count() -> int:
 
-    return len(
-        STATE_DATA["fired"].get(sym, [])
-    )
+    return len(STATE_DATA["orders"])
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -874,8 +910,6 @@ def place_long(
 
     sizing_price:
         Price used to calculate contracts.
-
-    For normal DCA orders both are the 9-day low.
     """
 
     vol = _contracts(
@@ -1059,33 +1093,28 @@ def get_mark(
     )
 
 
-# ── daily klines ──────────────────────────────────────────────────────────────
+# ── 1-minute klines ───────────────────────────────────────────────────────────
 
-def fetch_daily_bars(
+def fetch_minute_bars(
     sym: str,
-    lookback_days: int
+    start_s: int,
+    end_s: int
 ) -> List[Dict]:
 
     """
-    Fetch daily candles for the specified symbol.
+    Fetch 1-minute candles for [start_s, end_s) (unix seconds).
 
-    The current still-open daily candle is excluded.
+    Only fully CLOSED candles are returned — any candle whose end
+    time is after "now" is excluded.
     """
 
-    now_s = int(
-        time.time()
-    )
-
-    start_s = (
-        now_s
-        - (lookback_days + 2) * 86400
-    )
+    now_s = int(time.time())
 
     url = (
         f"{MEXC_BASE}/api/v1/contract/kline/{sym}"
-        f"?interval=Day1"
+        f"?interval=Min1"
         f"&start={start_s}"
-        f"&end={now_s}"
+        f"&end={end_s}"
     )
 
     try:
@@ -1095,7 +1124,7 @@ def fetch_daily_bars(
     except Exception as e:
 
         log.error(
-            f"[{sym}] daily kline fetch failed: {e}"
+            f"[{sym}] minute kline fetch failed: {e}"
         )
 
         return []
@@ -1103,7 +1132,7 @@ def fetch_daily_bars(
     if not raw.get("success"):
 
         log.error(
-            f"[{sym}] daily kline fetch "
+            f"[{sym}] minute kline fetch "
             f"unsuccessful: {raw}"
         )
 
@@ -1125,71 +1154,335 @@ def fetch_daily_bars(
         min(len(times), len(lows))
     ):
 
-        t_s = int(
-            times[i]
-        )
+        t_s = int(times[i])
 
-        if t_s + 86400 > now_s:
-
+        # Exclude any candle that hasn't fully closed yet.
+        if t_s + 60 > now_s:
             continue
 
         try:
-
-            low = float(
-                lows[i]
-            )
-
+            low = float(lows[i])
         except Exception:
-
             continue
 
         if low <= 0:
-
             continue
 
         bars.append({
-            "t": t_s * 1000,
+            "t": t_s,       # unix seconds, candle open time
             "l": low,
         })
 
-    bars.sort(
-        key=lambda b: b["t"]
-    )
+    bars.sort(key=lambda b: b["t"])
 
     return bars
 
 
-def rolling_9d_low(
-    sym: str
-) -> Optional[float]:
+# ── per-symbol rolling 1-minute buffer ────────────────────────────────────────
+#
+# In-memory only (not persisted across restarts — re-seeded fresh
+# from MEXC every startup, since it's a derived cache).
 
-    """
-    Minimum low of the latest ROLL_DAYS
-    closed daily bars.
-    """
+class MinuteBuffer:
 
-    bars = fetch_daily_bars(
-        sym,
-        ROLL_DAYS + 3
-    )
+    def __init__(self):
+        self.bars: Deque[Dict] = collections.deque()
+        self.lock = threading.Lock()
 
-    if len(bars) < ROLL_DAYS:
+    def seed(self, bars: List[Dict]):
 
-        log.error(
-            f"[{sym}] only {len(bars)} "
-            f"closed daily bars available, "
-            f"need {ROLL_DAYS} "
-            "— cannot compute 9d low"
+        with self.lock:
+            self.bars = collections.deque(bars)
+            self._trim_locked()
+
+    def append_new(self, bars: List[Dict]):
+
+        """
+        Appends any bars not already present (by open time), keeping
+        order, then trims to BUFFER_MAX_MINUTES.
+        """
+
+        with self.lock:
+
+            existing_ts = {
+                b["t"] for b in self.bars
+            }
+
+            for b in bars:
+
+                if b["t"] not in existing_ts:
+
+                    self.bars.append(b)
+                    existing_ts.add(b["t"])
+
+            self._sort_and_trim_locked()
+
+    def _sort_and_trim_locked(self):
+
+        self.bars = collections.deque(
+            sorted(self.bars, key=lambda b: b["t"])
         )
 
-        return None
+        self._trim_locked()
 
-    window = bars[-ROLL_DAYS:]
+    def _trim_locked(self):
 
-    return min(
-        b["l"]
-        for b in window
+        cutoff = int(time.time()) - BUFFER_MAX_MINUTES * 60
+
+        while self.bars and self.bars[0]["t"] < cutoff:
+            self.bars.popleft()
+
+    def latest_closed(self) -> Optional[Dict]:
+
+        with self.lock:
+
+            if not self.bars:
+                return None
+
+            return self.bars[-1]
+
+    def rolling_low(self, window_minutes: int) -> Optional[float]:
+
+        with self.lock:
+
+            if not self.bars:
+                return None
+
+            cutoff = int(time.time()) - window_minutes * 60
+
+            window = [
+                b["l"] for b in self.bars
+                if b["t"] >= cutoff
+            ]
+
+            if not window:
+                return None
+
+            return min(window)
+
+    def size(self) -> int:
+
+        with self.lock:
+            return len(self.bars)
+
+
+MINUTE_BUFFERS: Dict[str, MinuteBuffer] = {
+    sym: MinuteBuffer() for sym in SYMBOLS
+}
+
+
+def seed_minute_buffer(sym: str):
+
+    """
+    One-time startup seed of ~9 days of 1-minute history for sym.
+    """
+
+    now_s = int(time.time())
+
+    start_s = now_s - BUFFER_MAX_MINUTES * 60
+
+    bars = fetch_minute_bars(sym, start_s, now_s)
+
+    MINUTE_BUFFERS[sym].seed(bars)
+
+    log.info(
+        f"[{sym}] minute buffer seeded: "
+        f"{MINUTE_BUFFERS[sym].size()} bars"
     )
+
+
+def refresh_minute_buffer(sym: str):
+
+    """
+    Per-minute incremental update: fetch only the last couple of
+    minutes (covers the just-closed candle plus one margin candle
+    in case of any gap) and merge into the existing buffer.
+    """
+
+    now_s = int(time.time())
+
+    start_s = now_s - 5 * 60   # small overlap window for safety
+
+    bars = fetch_minute_bars(sym, start_s, now_s)
+
+    if bars:
+        MINUTE_BUFFERS[sym].append_new(bars)
+
+
+# ── minute-trigger engine ─────────────────────────────────────────────────────
+
+def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
+
+    """
+    The core per-minute logic for one symbol:
+
+      1. Ensure today's daily budget accrual has happened.
+      2. Refresh the symbol's rolling 1-minute candle buffer.
+      3. Look at the latest closed candle. If already processed
+         (same open time as last_seen_minute), skip.
+      4. Pick reference window based on current running budget.
+      5. If the candle's low <= reference low, it's a trigger:
+         stack $1 into the accumulator.
+      6. If the accumulator's contract-equivalent at the candle's
+         low >= exchange minimum, fire a real order at that price
+         for the full accumulated amount, reset accumulator, and
+         subtract the fired USD from the running budget.
+    """
+
+    if is_failed(sym):
+        return
+
+    today = now_utc.date()
+
+    accrue_daily_budget_if_due(sym, today)
+
+    refresh_minute_buffer(sym)
+
+    buf = MINUTE_BUFFERS[sym]
+
+    latest = buf.latest_closed()
+
+    if latest is None:
+
+        log.warning(
+            f"[{sym}] no closed 1-minute candle available yet "
+            "— skipping this minute"
+        )
+
+        return
+
+    candle_dt = datetime.datetime.fromtimestamp(
+        latest["t"], tz=UTC
+    )
+
+    last_seen = get_last_seen_minute(sym)
+
+    if last_seen is not None and candle_dt <= last_seen:
+
+        # Already processed this (or an older) candle — nothing new.
+        return
+
+    set_last_seen_minute(sym, candle_dt)
+
+    candle_low = latest["l"]
+
+    budget = get_budget(sym)
+
+    if budget >= 0:
+
+        ref_window = ROLL_MINUTES_SHORT
+        ref_label = "2d"
+
+    else:
+
+        ref_window = ROLL_MINUTES_LONG
+        ref_label = "9d"
+
+    ref_low = buf.rolling_low(ref_window)
+
+    if ref_low is None:
+
+        log.warning(
+            f"[{sym}] insufficient buffer data to compute "
+            f"{ref_label} low — skipping this minute"
+        )
+
+        return
+
+    triggered = candle_low <= ref_low
+
+    log.info(
+        f"[{sym}] minute check {candle_dt.isoformat()}: "
+        f"low={candle_low:.4f} "
+        f"{ref_label}Low={ref_low:.4f} "
+        f"budget={budget:.2f} "
+        f"trigger={triggered}"
+    )
+
+    if not triggered:
+        return
+
+    pending = add_trigger_dollar(sym)
+
+    log.info(
+        f"[{sym}] TRIGGER — accumulator now ${pending:.2f} "
+        f"@ price={candle_low:.4f}"
+    )
+
+    vol_at_price = _contracts(sym, pending, candle_low)
+
+    if vol_at_price < _mos(sym):
+
+        log.info(
+            f"[{sym}] accumulator ${pending:.2f} still below "
+            f"min order size ({_mos(sym)} contracts @ "
+            f"{candle_low:.4f}) — stacking, no order placed"
+        )
+
+        return
+
+    log.info(
+        f"[{sym}] accumulator ${pending:.2f} reaches min order "
+        f"size — firing limit LONG @ {candle_low:.4f}"
+    )
+
+    oid = place_long(
+        sym,
+        candle_low,
+        candle_low,
+        pending
+    )
+
+    if oid == "SKIP":
+
+        # Shouldn't normally happen since we just checked, but
+        # formatting/rounding could still push it under — leave
+        # the accumulator untouched and try again next trigger.
+        log.warning(
+            f"[{sym}] fire skipped by place_long despite passing "
+            "pre-check — leaving accumulator intact"
+        )
+
+        return
+
+    if oid is None:
+
+        log.error(
+            f"[{sym}] minute-trigger order rejected by MEXC — "
+            "leaving accumulator intact, will retry on next trigger"
+        )
+
+        return
+
+    reset_accumulator(sym)
+
+    spend_budget(sym, pending)
+
+    record_order({
+        "symbol": sym,
+        "timestamp": now_utc.isoformat(),
+        "candle_time": candle_dt.isoformat(),
+        "order_id": oid,
+        "limit_price": candle_low,
+        "usd": pending,
+        "reference_window": ref_label,
+    })
+
+
+def run_minute_checks(now_utc: datetime.datetime):
+
+    for sym in SYMBOLS:
+
+        try:
+
+            process_symbol_minute_check(sym, now_utc)
+
+        except Exception as e:
+
+            log.error(
+                f"[{sym}] minute check failed: {e}",
+                exc_info=True
+            )
 
 
 # ── startup test orders ───────────────────────────────────────────────────────
@@ -1202,19 +1495,11 @@ def rolling_9d_low(
 #
 # Any symbol that fails at any phase (invalid mark, rejected order,
 # cancel failure, or an exception) is flagged failed and excluded
-# from the DCA engine for the rest of this process's lifetime. A
-# symbol whose test order fills during the wait is NOT a failure —
-# it's a real position, logged as such, and the symbol stays
-# validated.
+# from the minute-trigger engine entirely. A symbol whose test order
+# fills during the wait is NOT a failure — it's a real position,
+# logged as such, and the symbol stays validated.
 
 def _open_test_order(sym: str) -> Optional[Dict]:
-
-    """
-    Phase 1 for one symbol: fetch mark, place the test order.
-
-    Returns a dict describing the pending test order on success, or
-    None if the symbol was flagged failed during this phase.
-    """
 
     if sym not in specs:
 
@@ -1287,11 +1572,6 @@ def _open_test_order(sym: str) -> Optional[Dict]:
 
 def _close_test_order(pending: Dict):
 
-    """
-    Phase 3 for one symbol: check fill status, cancel if unfilled,
-    flag failed if cancel fails.
-    """
-
     sym = pending["sym"]
     oid = pending["oid"]
 
@@ -1307,9 +1587,9 @@ def _close_test_order(pending: Dict):
                 "position. Symbol remains validated."
             )
 
-            record_order_only({
+            record_order({
                 "symbol": sym,
-                "date": datetime.datetime.now(UTC).date().isoformat(),
+                "timestamp": datetime.datetime.now(UTC).isoformat(),
                 "order_id": oid,
                 "kind": "startup_test_filled",
                 "limit_price": pending["limit_price"],
@@ -1352,19 +1632,6 @@ def _close_test_order(pending: Dict):
 
 def run_startup_test_orders():
 
-    """
-    Batch startup validation, three flat phases, no threads:
-
-      1. Send an OPEN test order for every symbol, one after another.
-      2. Sleep once for TEST_ORDER_WAIT_SEC, for the whole batch.
-      3. Send a CLOSE (fill-check + cancel) for every symbol that
-         successfully opened, one after another.
-
-    Total wall-clock time is roughly TEST_ORDER_WAIT_SEC plus the
-    time to fire off 2 x len(SYMBOLS) sequential requests — much
-    less than the old one-symbol-at-a-time design.
-    """
-
     log.info(
         f"══ startup test orders: {len(SYMBOLS)} symbols — "
         f"phase 1/3: opening ══"
@@ -1405,148 +1672,14 @@ def run_startup_test_orders():
     )
 
 
-# ── DCA trigger ──────────────────────────────────────────────────────────────
-
-def run_daily_dca(
-    now_utc: datetime.datetime
-):
-
-    """
-    Fire each eligible, non-failed symbol independently.
-
-    The order is:
-        LONG
-        limit price = 9-day low
-        sizing price = 9-day low
-        USD amount = symbol's own daily allocation
-
-    Previous unfilled orders are never cancelled.
-    """
-
-    today = now_utc.date()
-
-    for sym in SYMBOLS:
-
-        if is_failed(sym):
-
-            log.info(
-                f"[{sym}] skipped — flagged failed "
-                "at startup"
-            )
-
-            continue
-
-        if not in_dca_window(
-            sym,
-            today
-        ):
-
-            continue
-
-        if has_fired_today(
-            sym,
-            today
-        ):
-
-            log.info(
-                f"[{sym}] DCA already fired "
-                f"for {today.isoformat()} "
-                "— skipping"
-            )
-
-            continue
-
-        mark = get_mark(sym)
-
-        if mark <= 0:
-
-            log.error(
-                f"[{sym}] DCA invalid mark "
-                f"price ({mark}) "
-                "— skipping today"
-            )
-
-            continue
-
-        target = rolling_9d_low(sym)
-
-        if target is None:
-
-            log.error(
-                f"[{sym}] DCA could not compute "
-                "9d low — skipping today"
-            )
-
-            continue
-
-        daily_usd = DCA_DAILY_USD[sym]
-
-        log.info(
-            f"[{sym}] DCA fire "
-            f"{today.isoformat()}: "
-            f"limit LONG ${daily_usd:.2f} "
-            f"@ 9dLow={target:.4f} "
-            f"(sized off 9dLow, "
-            f"not mark={mark:.4f})"
-        )
-
-        oid = place_long(
-            sym,
-            target,
-            target,
-            daily_usd
-        )
-
-        if oid == "SKIP":
-
-            log.warning(
-                f"[{sym}] DCA fire skipped "
-                "— below minimum contract size; "
-                "NOT marked as fired"
-            )
-
-            continue
-
-        if oid is None:
-
-            log.error(
-                f"[{sym}] DCA fire rejected "
-                "by MEXC; NOT marked as fired"
-            )
-
-            continue
-
-        mark_fired(
-            sym,
-            today,
-            {
-                "symbol": sym,
-                "date": today.isoformat(),
-                "order_id": oid,
-                "limit_price": target,
-                "sizing_price": target,
-                "mark_at_fire": mark,
-                "usd": daily_usd,
-            }
-        )
-
-
 # ── SVG status ────────────────────────────────────────────────────────────────
 
-def render_svg(
-    marks: Dict[str, float],
-    lows: Dict[str, Optional[float]],
-    today: datetime.date
-) -> str:
+def render_svg(now_utc: datetime.datetime) -> str:
 
-    W = 1100
+    W = 1200
     H = 60 + 30 * len(SYMBOLS)
 
-    now_str = datetime.datetime.now(
-        UTC
-    ).strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
     svg = [
 
@@ -1568,7 +1701,7 @@ def render_svg(
             f'fill="#333" '
             f'font-weight="bold">'
             f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
-            f'own 9d-low pricing/sizing — {now_str}'
+            f'minute-trigger engine — {now_str}'
             f'</text>'
         ),
     ]
@@ -1599,94 +1732,35 @@ def render_svg(
 
             continue
 
-        mark = marks.get(
-            sym,
-            0.0
+        budget = get_budget(sym)
+        accum = get_accumulator(sym)
+
+        buf = MINUTE_BUFFERS[sym]
+
+        low2d = buf.rolling_low(ROLL_MINUTES_SHORT)
+        low9d = buf.rolling_low(ROLL_MINUTES_LONG)
+
+        low2d_str = f"{low2d:,.4f}" if low2d is not None else "n/a"
+        low9d_str = f"{low9d:,.4f}" if low9d is not None else "n/a"
+
+        ref = "2d" if budget >= 0 else "9d"
+
+        n_orders = sum(
+            1 for o in STATE_DATA["orders"]
+            if o.get("symbol") == sym and "reference_window" in o
         )
 
-        low = lows.get(sym)
-
-        low_str = (
-            f"{low:,.4f}"
-            if low is not None
-            else "n/a"
-        )
-
-        start = DCA_START_DATE[sym]
-        days = DCA_DAYS[sym]
-        budget = DCA_BUDGET_USD[sym]
-        daily = DCA_DAILY_USD[sym]
-
-        end = (
-            start
-            + datetime.timedelta(
-                days=days - 1
-            )
-        )
-
-        n_fired = fired_count(sym)
-
-        active = in_dca_window(
-            sym,
-            today
-        )
-
-        fired_today = has_fired_today(
-            sym,
-            today
-        )
-
-        remaining_usd = max(
-            0.0,
-            budget - n_fired * daily
-        )
-
-        if today < start:
-
-            phase = (
-                f"not started "
-                f"(begins {start.isoformat()})"
-            )
-
-        elif today > end:
-
-            phase = (
-                f"window complete "
-                f"({end.isoformat()})"
-            )
-
-        else:
-
-            phase = (
-                f"day {(today - start).days + 1}"
-                f"/{days}"
-            )
-
-            if fired_today:
-
-                phase += " — fired today"
-
-            elif active:
-
-                phase += " — pending today"
-
-        clr = (
-            "#1a8a1a"
-            if fired_today
-            else (
-                "#1155cc"
-                if active
-                else "#888"
-            )
-        )
+        clr = "#1155cc" if budget >= 0 else "#cc7a00"
 
         line = (
             f"{sym:<16} "
-            f"mark={mark:>12,.4f}  "
-            f"9dLow={low_str:>12}   "
-            f"fired={n_fired:>3}/{days}   "
-            f"remaining=${remaining_usd:>8,.2f}   "
-            f"{phase}"
+            f"budget=${budget:>8,.2f}  "
+            f"accum=${accum:>5,.2f}  "
+            f"ref={ref}  "
+            f"2dLow={low2d_str:>12}  "
+            f"9dLow={low9d_str:>12}  "
+            f"fires={n_orders:>4}  "
+            f"buf={buf.size():>6}m"
         )
 
         svg.append(
@@ -1700,74 +1774,48 @@ def render_svg(
 
         y += 30
 
-    svg.append(
-        "</svg>"
-    )
+    svg.append("</svg>")
 
     return "\n".join(svg)
 
 
 # ── engine timing ─────────────────────────────────────────────────────────────
 
-def _seconds_until_next_hour() -> float:
+def _seconds_until_next_minute_mark() -> float:
+
+    """
+    Seconds until the next MINUTE_CHECK_SECOND-past-the-minute mark.
+    """
 
     now = time.time()
 
-    return (
-        (int(now) // 3600 + 1) * 3600
-        + HOURLY_SLEEP_FLOOR_SEC
-        - now
+    next_mark = (
+        (int(now) // 60 + 1) * 60
+        + MINUTE_CHECK_SECOND
     )
+
+    return next_mark - now
 
 
 # ── engine cycle ─────────────────────────────────────────────────────────────
 
 def engine_cycle():
 
-    now_utc = datetime.datetime.now(
-        UTC
-    )
+    now_utc = datetime.datetime.now(UTC)
 
-    active_symbols = [
-        sym for sym in SYMBOLS
-        if not is_failed(sym)
-    ]
+    run_minute_checks(now_utc)
 
-    marks = {
-        sym: get_mark(sym)
-        for sym in active_symbols
-    }
-
-    lows = {
-        sym: rolling_9d_low(sym)
-        for sym in active_symbols
-    }
-
-    if now_utc.hour == 0:
-
-        run_daily_dca(
-            now_utc
-        )
-
-    svg = render_svg(
-        marks,
-        lows,
-        now_utc.date()
-    )
+    svg = render_svg(now_utc)
 
     STATE.set_svg(svg)
 
-    n_fired_total = sum(
-        len(v)
-        for v in STATE_DATA["fired"].values()
-    )
-
+    n_orders = total_orders_count()
     n_failed = len(FAILED_SYMBOLS)
 
     STATE.set_status(
         f"ok  "
-        f"{now_utc.strftime('%Y-%m-%d %H:%M UTC')}  "
-        f"total_fires={n_fired_total}  "
+        f"{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}  "
+        f"total_orders={n_orders}  "
         f"failed_symbols={n_failed}"
     )
 
@@ -1781,8 +1829,28 @@ def run_engine():
     run_startup_test_orders()
 
     log.info(
-        "engine starting — "
-        "running initial cycle"
+        "seeding 1-minute candle buffers "
+        f"(~{BUFFER_MAX_MINUTES} minutes each)"
+    )
+
+    for sym in SYMBOLS:
+
+        if is_failed(sym):
+            continue
+
+        try:
+
+            seed_minute_buffer(sym)
+
+        except Exception as e:
+
+            log.error(
+                f"[{sym}] failed to seed minute buffer: {e}",
+                exc_info=True
+            )
+
+    log.info(
+        "engine starting — running initial cycle"
     )
 
     try:
@@ -1796,17 +1864,13 @@ def run_engine():
             exc_info=True
         )
 
-        STATE.set_status(
-            f"error: {e}"
-        )
+        STATE.set_status(f"error: {e}")
 
     while True:
 
-        wait_s = _seconds_until_next_hour()
+        wait_s = _seconds_until_next_minute_mark()
 
-        time.sleep(
-            max(0, wait_s)
-        )
+        time.sleep(max(0, wait_s))
 
         try:
 
@@ -1819,9 +1883,7 @@ def run_engine():
                 exc_info=True
             )
 
-            STATE.set_status(
-                f"error: {e}"
-            )
+            STATE.set_status(f"error: {e}")
 
 
 # ── HTTP server ───────────────────────────────────────────────────────────────
@@ -1842,79 +1904,53 @@ class Handler(
 
         if self.path == "/chart.svg":
 
-            svg = STATE.get_svg().encode(
-                "utf-8"
-            )
+            svg = STATE.get_svg().encode("utf-8")
 
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "image/svg+xml"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(svg))
-            )
-
-            self.send_header(
-                "Cache-Control",
-                "no-cache"
-            )
-
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-
             self.wfile.write(svg)
 
         elif self.path == "/orders.json":
 
             body = json.dumps(
-                STATE_DATA["orders"],
-                indent=2
-            ).encode(
-                "utf-8"
-            )
+                STATE_DATA["orders"], indent=2
+            ).encode("utf-8")
 
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
             self.wfile.write(body)
 
         elif self.path == "/failed.json":
 
             body = json.dumps(
-                sorted(FAILED_SYMBOLS),
-                indent=2
-            ).encode(
-                "utf-8"
-            )
+                sorted(FAILED_SYMBOLS), indent=2
+            ).encode("utf-8")
 
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
 
+        elif self.path == "/budget.json":
+
+            body = json.dumps(
+                {
+                    "budget": STATE_DATA["budget"],
+                    "accumulator": STATE_DATA["accumulator"],
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
             self.wfile.write(body)
 
         elif (
@@ -1929,7 +1965,7 @@ class Handler(
                 "<html>"
                 "<head>"
                 "<meta charset='utf-8'>"
-                "<meta http-equiv='refresh' content='300'>"
+                "<meta http-equiv='refresh' content='60'>"
                 "<title>MultiLongDCA-Bot Overview</title>"
                 "<style>"
                 "body{font-family:monospace;"
@@ -1941,48 +1977,35 @@ class Handler(
                 "<body>"
                 "<h3>"
                 "MultiLongDCA-Bot — "
-                "Multi-Symbol DCA Long Bot"
+                "Multi-Symbol Minute-Trigger DCA Long Bot"
                 "</h3>"
                 f"<p>status: {status}</p>"
                 "<img src='/chart.svg' "
                 "alt='overview table'/>"
                 "<p>"
-                "<a href='/orders.json'>"
-                "order records (JSON)"
-                "</a>"
+                "<a href='/orders.json'>order records</a>"
                 " · "
-                "<a href='/failed.json'>"
-                "failed symbols (JSON)"
-                "</a>"
+                "<a href='/budget.json'>budget/accumulator</a>"
+                " · "
+                "<a href='/failed.json'>failed symbols</a>"
                 "</p>"
                 "</body>"
                 "</html>"
             )
 
-            body = html.encode(
-                "utf-8"
-            )
+            body = html.encode("utf-8")
 
             self.send_response(200)
-
             self.send_header(
-                "Content-Type",
-                "text/html; charset=utf-8"
+                "Content-Type", "text/html; charset=utf-8"
             )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
             self.wfile.write(body)
 
         else:
 
             self.send_response(404)
-
             self.end_headers()
 
 
@@ -1990,16 +2013,13 @@ class Handler(
 
 def run_server():
 
-    server = (
-        http.server.ThreadingHTTPServer(
-            (HTTP_HOST, HTTP_PORT),
-            Handler
-        )
+    server = http.server.ThreadingHTTPServer(
+        (HTTP_HOST, HTTP_PORT),
+        Handler
     )
 
     log.info(
-        f"server listening on "
-        f"{HTTP_HOST}:{HTTP_PORT}"
+        f"server listening on {HTTP_HOST}:{HTTP_PORT}"
     )
 
     server.serve_forever()
@@ -2011,9 +2031,7 @@ def main():
 
     if not MEXC_KEY or not MEXC_SECRET:
 
-        log.error(
-            "MEXC / MEXCSECRET not set"
-        )
+        log.error("MEXC / MEXCSECRET not set")
 
         raise SystemExit(1)
 
