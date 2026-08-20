@@ -1525,27 +1525,115 @@ MINUTE_BUFFERS: Dict[str, MinuteBuffer] = {
 }
 
 
+# ── seeding constants ──────────────────────────────────────────────────────────
+
+# MEXC's kline endpoint appears to cap results per request (observed
+# ~2000 candles regardless of requested start/end span). Seeding
+# therefore pages backward through time in chunks rather than
+# requesting the whole window in one call.
+SEED_CHUNK_MINUTES = 1500   # comfortably under the observed ~2000 cap
+SEED_MAX_CHUNKS = (BUFFER_MAX_MINUTES // SEED_CHUNK_MINUTES) + 3  # safety margin
+
+
 def seed_minute_buffer(sym: str):
 
     """
     One-time startup seed of ~10 days of 1-minute history for sym.
+
+    A single fetch_minute_bars call for the full BUFFER_MAX_MINUTES
+    window is NOT sufficient — MEXC's kline endpoint appears to cap
+    the number of candles returned per request (observed ~2000)
+    regardless of the requested start/end span, silently truncating
+    rather than erroring. So this pages backward through time in
+    SEED_CHUNK_MINUTES-sized windows, oldest chunk last, merging
+    each into the buffer, until either the full BUFFER_MAX_MINUTES
+    window is covered or a chunk comes back empty (meaning history
+    doesn't go back further, e.g. a newly listed contract).
+
     Called for EVERY symbol regardless of failed status, so failed
-    symbols still get charts.
+    symbols still get full-history charts.
     """
 
     now_s = int(time.time())
 
-    start_s = now_s - BUFFER_MAX_MINUTES * 60
+    window_start_s = now_s - BUFFER_MAX_MINUTES * 60
 
-    bars = fetch_minute_bars(sym, start_s, now_s)
+    all_bars: Dict[int, Dict] = {}
 
-    MINUTE_BUFFERS[sym].seed(bars)
+    chunk_end_s = now_s
+
+    chunks_fetched = 0
+
+    while chunk_end_s > window_start_s and chunks_fetched < SEED_MAX_CHUNKS:
+
+        chunk_start_s = max(
+            window_start_s,
+            chunk_end_s - SEED_CHUNK_MINUTES * 60
+        )
+
+        bars = fetch_minute_bars(sym, chunk_start_s, chunk_end_s)
+
+        chunks_fetched += 1
+
+        if not bars:
+
+            log.info(
+                f"[{sym}] seed chunk "
+                f"[{chunk_start_s}, {chunk_end_s}) returned no bars "
+                "— stopping (likely reached start of available history)"
+            )
+
+            break
+
+        for b in bars:
+            all_bars[b["t"]] = b
+
+        log.info(
+            f"[{sym}] seed chunk "
+            f"[{chunk_start_s}, {chunk_end_s}): "
+            f"{len(bars)} bars fetched, "
+            f"{len(all_bars)} total so far"
+        )
+
+        # Move the window back. Use the earliest bar actually
+        # returned (not just chunk_start_s) in case MEXC's response
+        # doesn't start exactly at the requested boundary.
+        earliest_returned = min(b["t"] for b in bars)
+
+        chunk_end_s = earliest_returned
+
+        # Small guard against an unresponsive/no-progress loop if
+        # the API returns the same earliest bar repeatedly.
+        if chunk_end_s >= chunk_start_s + SEED_CHUNK_MINUTES * 60:
+            break
+
+    sorted_bars = [all_bars[t] for t in sorted(all_bars.keys())]
+
+    MINUTE_BUFFERS[sym].seed(sorted_bars)
+
+    span_days = (
+        (sorted_bars[-1]["t"] - sorted_bars[0]["t"]) / 86400.0
+        if len(sorted_bars) >= 2
+        else 0.0
+    )
 
     log.info(
         f"[{sym}] minute buffer seeded: "
-        f"{MINUTE_BUFFERS[sym].size()} bars"
+        f"{MINUTE_BUFFERS[sym].size()} bars "
+        f"across {chunks_fetched} chunk(s), "
+        f"spanning ~{span_days:.1f} days "
+        f"(target: {BUFFER_MAX_MINUTES / 1440:.1f} days)"
     )
 
+    if span_days < (BUFFER_MAX_MINUTES / 1440.0) * 0.9:
+
+        log.warning(
+            f"[{sym}] seeded buffer spans only ~{span_days:.1f} days, "
+            f"short of the ~{BUFFER_MAX_MINUTES / 1440:.1f}-day target — "
+            "9d-low reference and 10d chart will be based on "
+            "incomplete history until the buffer naturally fills in "
+            "over the next few days of minute-by-minute updates"
+        )
 
 def refresh_minute_buffer(sym: str):
 
