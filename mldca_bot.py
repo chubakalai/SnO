@@ -26,7 +26,7 @@ Per-symbol running budget:
     go negative.
 
 Per-minute check (runs once per minute, at :01 past the minute, for
-every non-failed symbol independently):
+EVERY symbol, including FAILED ones — see FAILED SYMBOLS below):
   1. Look at the most recently CLOSED 1-minute candle.
   2. Choose the reference window based on the symbol's CURRENT
      running budget at the moment of the check:
@@ -35,62 +35,103 @@ every non-failed symbol independently):
      Both are computed from the trailing window of closed 1-minute
      candles (2 days = 2880 minutes, 9 days = 12960 minutes).
   3. If the closed candle's low is <= that reference low, it is a
-     TRIGGER: add $1 to the symbol's pending accumulator.
-  4. If the accumulator's contract-equivalent at the triggering
-     candle's low price is >= the exchange's minimum order size, a
-     real limit LONG is placed at exactly that low price for the
-     full accumulated amount; the accumulator resets to 0 and the
-     amount is subtracted from the running budget. Otherwise the
-     accumulator carries forward untouched.
+     TRIGGER.
+  4. For NON-FAILED symbols only: a trigger adds $1 to the pending
+     accumulator, and if the accumulator's contract-equivalent at
+     the triggering candle's low is >= the exchange's minimum order
+     size, a real limit LONG is placed at exactly that low price
+     for the full accumulated amount; the accumulator resets to 0
+     and the amount is subtracted from the running budget.
+  5. For FAILED symbols: the trigger is evaluated and recorded (so
+     it can be marked on the chart) but NO budget accrual, NO
+     accumulator, and NO order is ever attempted — see FAILED
+     SYMBOLS below.
 
 Rolling 1-minute OHLC candle buffer (per symbol):
-  - Seeded ONCE at startup with ~10 days of 1-minute history.
+  - Seeded ONCE at startup with ~10 days of 1-minute history, for
+    EVERY symbol including failed ones (so their charts have data).
   - Updated every minute by fetching only the most recently closed
-    candle(s) and appending them; candles older than the buffer
-    window are dropped.
+    candle(s) and appending them, for every symbol regardless of
+    failed status.
   - Powers both the trigger-reference lows AND the 15m-resampled
     10-day chart (see CHARTS below).
 
-Failed symbols (see startup test orders) are fully frozen: no
-budget accrual, no candle checks, for the remainder of the process's
-lifetime.
+═══════════════════════════════════════════════════════════════════
+FAILED SYMBOLS
+═══════════════════════════════════════════════════════════════════
+
+A symbol that fails its startup test order is flagged FAILED for
+the remainder of the process's lifetime. This excludes it from
+TRADING ONLY:
+  - No budget accrual.
+  - No accumulator, no order attempts, ever.
+
+It does NOT exclude the symbol from CHARTING:
+  - Its 1-minute buffer keeps refreshing every minute, same as any
+    other symbol.
+  - Its chart keeps rendering every minute, same as any other
+    symbol, and is linked from the main overview page exactly like
+    a healthy symbol.
+  - Trigger conditions are still evaluated every minute purely for
+    charting purposes (an "X marks the spot where this WOULD have
+    triggered" reference) and shown as small trigger markers on the
+    chart. Because failed symbols never call place_long, they never
+    have order markers — the chart legend distinguishes trigger
+    markers (small tick marks) from order markers (circles), and a
+    failed symbol's chart will only ever show the former.
 
 ═══════════════════════════════════════════════════════════════════
 CHARTS
 ═══════════════════════════════════════════════════════════════════
 
-Each symbol gets its own SVG candlestick chart: the trailing 10 days
-of 1-minute candles, resampled to 15-minute OHLC candles (~960
-candles). The chart marks:
+Each symbol — failed or not — gets its own SVG candlestick chart:
+the trailing 10 days of 1-minute candles, resampled to 15-minute
+OHLC candles (~960 candles). The chart marks:
   - Whichever reference low is currently active (2d or 9d, based on
-    that symbol's budget sign) as a dashed horizontal threshold line.
-  - Every order placed for that symbol as a marker at its fire time
-    and price.
+    that symbol's budget sign) as a dashed horizontal threshold
+    line. For failed symbols (budget frozen at 0 or whatever it was
+    at time of failure), this still reflects budget sign the same
+    way.
+  - Every TRIGGER (candle low <= reference low) as a small tick
+    marker on the price axis at that candle's time/price.
+  - Every REAL ORDER placed for that symbol (never happens for
+    failed symbols) as a filled circle marker at its fire
+    time/price.
 
 Charts are re-rendered every minute, AFTER the minute-trigger
 trading logic runs, so chart rendering never delays order placement.
-Served at /chart/<SYMBOL>.svg and linked from the main overview page.
+Served at /chart/<SYMBOL>.svg and linked from the main overview page
+for every symbol, failed or not.
 
 ═══════════════════════════════════════════════════════════════════
 DAILY ACTIVITY REPORT (ntfy)
 ═══════════════════════════════════════════════════════════════════
 
-Once per UTC calendar day, at 14:00 UTC, a plain-text activity
-report is pushed to the ntfy.sh topic
+Once per UTC calendar day, at or after 14:00 UTC, a plain-text
+activity report is pushed to the ntfy.sh topic
 "1618091301200506091401140305" (https://ntfy.sh/<topic>), one line
-per symbol, covering that UTC day's activity up to send time:
+per symbol, covering activity SINCE THE LAST SUCCESSFULLY SENT
+REPORT (not since UTC midnight):
   - number of triggers
   - order value (sum of USD on successfully placed orders)
   - number of successful order placements
   - number of unsuccessful order placements (rejected or below
     minimum size)
   - average price across all attempted order placements
-    (successful + unsuccessful)
 
-Daily counters reset at UTC midnight (independent of, but aligned
-with, the budget accrual reset). The report send is itself
-idempotent per UTC date via a persisted "last report date" so a
-restart near 14:00 UTC cannot double-send.
+Per-symbol daily counters are NOT reset at UTC midnight. They reset
+ONLY immediately after a report has been successfully sent, so the
+reporting window is always "since the last report" — under normal
+operation this is ~24h (14:00 UTC to 14:00 UTC the next day), with
+no gap and no double-counted period. A restart near 14:00 UTC cannot
+cause a duplicate send: the guard requires both (a) current time is
+at/after 14:00 UTC, AND (b) at least 20 hours have passed since the
+last successful send.
+
+Failed symbols are still counted in the report (their trigger count
+will be nonzero if price action crossed their reference low; their
+order counts will always be 0/0 since no orders are ever attempted)
+so the report reflects that they're being watched but not traded.
 
 ═══════════════════════════════════════════════════════════════════
 STARTUP TEST ORDERS
@@ -105,9 +146,9 @@ STARTUP TEST ORDERS
          symbol that opened.
 
     ANY failure at any phase flags that symbol FAILED for the
-    remainder of this process's lifetime: fully excluded from the
-    minute-trigger engine and shown flagged on the status page. A
-    test order that fills during the wait is NOT a failure.
+    remainder of this process's lifetime — see FAILED SYMBOLS above
+    for exactly what that does and doesn't exclude. A test order
+    that fills during the wait is NOT a failure.
 
 Environment (secrets only, not behavior):
   MEXC        - MEXC API key
@@ -151,9 +192,6 @@ MEXC_BASE   = "https://api.mexc.co"
 
 # ── symbol configuration ──────────────────────────────────────────────────────
 #
-# Single source of truth for which symbols the bot trades. To add or
-# remove a symbol, only edit SYMBOLS below.
-#
 # USOIL_USDT     = WTI Crude Oil
 # UKOIL_USDT     = Brent Crude Oil
 # SPCXSTOCK_USDT = SPCX
@@ -191,8 +229,6 @@ MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 CHART_MINUTES       = 10 * 24 * 60   # 10 days of 1-minute history for the chart
 CHART_RESAMPLE_MIN  = 15             # resample 1m -> 15m OHLC candles
 
-# Buffer must cover the longest of: 9d-low window, or the 10d chart
-# window, plus a little slack for trimming.
 BUFFER_MAX_MINUTES = max(ROLL_MINUTES_LONG, CHART_MINUTES) + 60
 
 CHART_W = 1200
@@ -210,6 +246,11 @@ NTFY_URL       = f"https://ntfy.sh/{NTFY_TOPIC}"
 REPORT_HOUR_UTC   = 14
 REPORT_MINUTE_UTC = 0
 
+# Minimum time that must pass since the last successful send before
+# another can go out, even if we're past REPORT_HOUR_UTC again —
+# guards against double-send on restart near 14:00 UTC.
+REPORT_MIN_INTERVAL_HOURS = 20
+
 
 # ── timing ────────────────────────────────────────────────────────────────────
 
@@ -223,6 +264,10 @@ TEST_ORDER_WAIT_SEC = 20
 
 
 # ── failed-symbol tracking ────────────────────────────────────────────────────
+#
+# FAILED excludes a symbol from TRADING ONLY (budget accrual,
+# accumulator, order attempts). It does NOT exclude charting or
+# buffer refresh or trigger evaluation — see module docstring.
 
 FAILED_SYMBOLS: set = set()
 _FAILED_LOCK = threading.Lock()
@@ -235,7 +280,7 @@ def flag_failed(sym: str, reason: str):
 
     log.error(
         f"[{sym}] FLAGGED FAILED — {reason} — "
-        "excluded from minute-trigger engine"
+        "excluded from trading (buffer/chart/trigger-marking continue)"
     )
 
 
@@ -325,13 +370,17 @@ STATE = SharedState()
 #
 # {
 #   "orders": [...],
+#   "triggers": [
+#       {"symbol": "...", "candle_time": "...", "price": ..., "window": "2d"},
+#       ...
+#   ],
 #   "budget": {"USOIL_USDT": 3.50, ...},
 #   "accumulator": {"USOIL_USDT": 0.0, ...},
 #   "last_accrual_date": {"USOIL_USDT": "2026-08-20", ...},
 #   "last_seen_minute": {"USOIL_USDT": "2026-08-20T14:07:00+00:00", ...},
 #   "daily_stats": {
 #       "USOIL_USDT": {
-#           "date": "2026-08-20",
+#           "window_start": "2026-08-20T14:00:03+00:00",
 #           "triggers": 0,
 #           "order_value_usd": 0.0,
 #           "orders_ok": 0,
@@ -341,12 +390,16 @@ STATE = SharedState()
 #       },
 #       ...
 #   },
-#   "last_report_date": "2026-08-19"
+#   "last_report_sent_at": "2026-08-19T14:00:07+00:00"
 # }
+#
+# "triggers" is a lightweight rolling log (trimmed to the chart
+# window) used purely to render trigger markers on charts —
+# separate from "orders", which only ever contains real fills.
 
-def _default_daily_stats() -> Dict:
+def _default_daily_stats(now_iso: str) -> Dict:
     return {
-        "date": None,
+        "window_start": now_iso,
         "triggers": 0,
         "order_value_usd": 0.0,
         "orders_ok": 0,
@@ -359,12 +412,13 @@ def _default_daily_stats() -> Dict:
 def _default_state() -> Dict:
     return {
         "orders": [],
+        "triggers": [],
         "budget": {},
         "accumulator": {},
         "last_accrual_date": {},
         "last_seen_minute": {},
         "daily_stats": {},
-        "last_report_date": None,
+        "last_report_sent_at": None,
     }
 
 
@@ -477,6 +531,10 @@ def _persist():
 
 def accrue_daily_budget_if_due(sym: str, today: datetime.date):
 
+    """
+    NON-FAILED symbols only — callers must check is_failed() first.
+    """
+
     with _STATE_DATA_LOCK:
 
         last = get_last_accrual_date(sym)
@@ -561,6 +619,50 @@ def record_order(order_record: Dict):
         _persist()
 
 
+def record_trigger_marker(
+    sym: str,
+    candle_dt: datetime.datetime,
+    price: float,
+    window_label: str
+):
+
+    """
+    Lightweight log entry used purely for chart trigger markers.
+    Recorded for EVERY symbol on every trigger, failed or not.
+    Trimmed to roughly the chart window on write to bound growth.
+    """
+
+    with _STATE_DATA_LOCK:
+
+        STATE_DATA["triggers"].append({
+            "symbol": sym,
+            "candle_time": candle_dt.isoformat(),
+            "price": price,
+            "window": window_label,
+        })
+
+        cutoff = time.time() - CHART_MINUTES * 60 - 3600
+
+        STATE_DATA["triggers"] = [
+            t for t in STATE_DATA["triggers"]
+            if _safe_ts(t.get("candle_time")) is None
+            or _safe_ts(t.get("candle_time")) >= cutoff
+        ]
+
+        _persist()
+
+
+def _safe_ts(iso_str: Optional[str]) -> Optional[float]:
+
+    if not iso_str:
+        return None
+
+    try:
+        return datetime.datetime.fromisoformat(iso_str).timestamp()
+    except Exception:
+        return None
+
+
 def total_orders_count() -> int:
 
     return len(STATE_DATA["orders"])
@@ -568,32 +670,28 @@ def total_orders_count() -> int:
 
 # ── daily stats (activity report counters) ────────────────────────────────────
 
-def _ensure_daily_stats_current(sym: str, today: datetime.date):
+def _ensure_daily_stats_initialized(sym: str):
 
     """
-    Resets a symbol's daily counters if the stored date doesn't
-    match today (UTC). Must be called under _STATE_DATA_LOCK by
-    callers, OR called standalone (it takes the lock itself) —
-    see call sites below, all of which call it standalone.
+    Ensures a daily_stats entry exists for sym. Does NOT reset based
+    on calendar date anymore — resets only happen explicitly after
+    a successful report send (see reset_daily_stats_all below).
     """
 
     with _STATE_DATA_LOCK:
 
-        stats = STATE_DATA["daily_stats"].get(sym)
+        if sym not in STATE_DATA["daily_stats"]:
 
-        if stats is None or stats.get("date") != today.isoformat():
+            now_iso = datetime.datetime.now(UTC).isoformat()
 
-            fresh = _default_daily_stats()
-            fresh["date"] = today.isoformat()
-
-            STATE_DATA["daily_stats"][sym] = fresh
+            STATE_DATA["daily_stats"][sym] = _default_daily_stats(now_iso)
 
             _persist()
 
 
-def record_trigger_stat(sym: str, today: datetime.date):
+def record_trigger_stat(sym: str):
 
-    _ensure_daily_stats_current(sym, today)
+    _ensure_daily_stats_initialized(sym)
 
     with _STATE_DATA_LOCK:
 
@@ -604,18 +702,17 @@ def record_trigger_stat(sym: str, today: datetime.date):
 
 def record_attempt_stat(
     sym: str,
-    today: datetime.date,
     price: float,
     success: bool,
     usd_if_success: float = 0.0
 ):
 
     """
-    Records one order-placement ATTEMPT (call to place_long),
-    whether it succeeded or not, for the daily report.
+    NON-FAILED symbols only — failed symbols never attempt orders,
+    so this is never called for them.
     """
 
-    _ensure_daily_stats_current(sym, today)
+    _ensure_daily_stats_initialized(sym)
 
     with _STATE_DATA_LOCK:
 
@@ -633,33 +730,54 @@ def record_attempt_stat(
         _persist()
 
 
-def get_daily_stats_snapshot(sym: str, today: datetime.date) -> Dict:
+def get_daily_stats_snapshot(sym: str) -> Dict:
 
-    _ensure_daily_stats_current(sym, today)
+    _ensure_daily_stats_initialized(sym)
 
     with _STATE_DATA_LOCK:
 
-        return dict(STATE_DATA["daily_stats"].get(sym, _default_daily_stats()))
+        return dict(STATE_DATA["daily_stats"].get(
+            sym, _default_daily_stats(datetime.datetime.now(UTC).isoformat())
+        ))
 
 
-def get_last_report_date() -> Optional[datetime.date]:
+def reset_daily_stats_all(now_utc: datetime.datetime):
 
-    s = STATE_DATA.get("last_report_date")
+    """
+    Called ONLY immediately after a successful report send. Resets
+    every symbol's counters and sets window_start to now, so the
+    next report covers exactly "since this reset."
+    """
+
+    now_iso = now_utc.isoformat()
+
+    with _STATE_DATA_LOCK:
+
+        for sym in SYMBOLS:
+
+            STATE_DATA["daily_stats"][sym] = _default_daily_stats(now_iso)
+
+        _persist()
+
+
+def get_last_report_sent_at() -> Optional[datetime.datetime]:
+
+    s = STATE_DATA.get("last_report_sent_at")
 
     if not s:
         return None
 
     try:
-        return datetime.date.fromisoformat(s)
+        return datetime.datetime.fromisoformat(s)
     except Exception:
         return None
 
 
-def set_last_report_date(d: datetime.date):
+def set_last_report_sent_at(dt: datetime.datetime):
 
     with _STATE_DATA_LOCK:
 
-        STATE_DATA["last_report_date"] = d.isoformat()
+        STATE_DATA["last_report_sent_at"] = dt.isoformat()
 
         _persist()
 
@@ -796,12 +914,12 @@ def mexc(
 
 # ── ntfy ──────────────────────────────────────────────────────────────────────
 
-def ntfy_send(message: str, title: Optional[str] = None):
+def ntfy_send(message: str, title: Optional[str] = None) -> bool:
 
     """
-    Pushes a plain-text message to the configured ntfy.sh topic via
-    a simple HTTP POST. Best-effort — failures are logged, never
-    raised, since a failed notification should not affect trading.
+    Pushes a plain-text message to the configured ntfy.sh topic.
+    Returns True on apparent success, False on failure. Never
+    raises — a failed notification must not affect trading.
     """
 
     headers = {"Content-Type": "text/plain; charset=utf-8"}
@@ -824,9 +942,13 @@ def ntfy_send(message: str, title: Optional[str] = None):
 
         log.info(f"ntfy: report sent to {NTFY_URL}")
 
+        return True
+
     except Exception as e:
 
         log.error(f"ntfy: failed to send report: {e}")
+
+        return False
 
 
 # ── contract specifications ───────────────────────────────────────────────────
@@ -836,16 +958,9 @@ def load_specs():
     """
     Fetch contract specifications once for every symbol.
 
-    Nothing is hardcoded for:
-      - priceUnit
-      - volUnit
-      - contractSize
-
-    The live MEXC contract detail response is authoritative.
-
     A symbol whose specs cannot be loaded is flagged failed rather
     than aborting the whole process, so other symbols can still
-    trade.
+    trade (and this symbol can still chart).
     """
 
     rows = (
@@ -984,11 +1099,6 @@ def _contracts(
     price
 ):
 
-    """
-    Contract count so that approximately `usd`
-    dollars of notional trades at `price`.
-    """
-
     cs = specs.get(
         sym,
         {}
@@ -1007,11 +1117,6 @@ def _contracts(
 
 def _mos(sym):
 
-    """
-    Minimum order size, in contracts, as reported by the exchange
-    (volUnit).
-    """
-
     return specs.get(
         sym,
         {}
@@ -1023,11 +1128,6 @@ def _mos(sym):
 def _open_orders_for_sym(
     sym: str
 ) -> List[Dict]:
-
-    """
-    MEXC's symbol query parameter is not treated
-    as authoritative here, so filter client-side.
-    """
 
     data = (
         mexc(
@@ -1074,17 +1174,6 @@ def place_long(
     usd_amount: float
 ) -> Optional[str]:
 
-    """
-    Place a limit LONG / buy-to-open order, sized in USD notional
-    (converted to contracts via sizing_price).
-
-    limit_price:
-        Actual order limit price.
-
-    sizing_price:
-        Price used to calculate contracts.
-    """
-
     vol = _contracts(
         sym,
         usd_amount,
@@ -1112,12 +1201,6 @@ def place_long_min_size(
     sym: str,
     limit_price: float
 ) -> Optional[str]:
-
-    """
-    Place a limit LONG sized at exactly this symbol's own
-    exchange-reported minimum order size (contracts), regardless of
-    USD notional. Used for startup test orders.
-    """
 
     vol = _mos(sym)
 
@@ -1273,13 +1356,6 @@ def fetch_minute_bars(
     end_s: int
 ) -> List[Dict]:
 
-    """
-    Fetch 1-minute OHLC candles for [start_s, end_s) (unix seconds).
-
-    Only fully CLOSED candles are returned — any candle whose end
-    time is after "now" is excluded.
-    """
-
     now_s = int(time.time())
 
     url = (
@@ -1350,9 +1426,6 @@ def fetch_minute_bars(
 
 
 # ── per-symbol rolling 1-minute OHLC buffer ───────────────────────────────────
-#
-# In-memory only (not persisted across restarts — re-seeded fresh
-# from MEXC every startup, since it's a derived cache).
 
 class MinuteBuffer:
 
@@ -1446,6 +1519,8 @@ def seed_minute_buffer(sym: str):
 
     """
     One-time startup seed of ~10 days of 1-minute history for sym.
+    Called for EVERY symbol regardless of failed status, so failed
+    symbols still get charts.
     """
 
     now_s = int(time.time())
@@ -1465,9 +1540,8 @@ def seed_minute_buffer(sym: str):
 def refresh_minute_buffer(sym: str):
 
     """
-    Per-minute incremental update: fetch only the last few minutes
-    (covers the just-closed candle plus margin in case of any gap)
-    and merge into the existing buffer.
+    Per-minute incremental update. Called for EVERY symbol
+    regardless of failed status.
     """
 
     now_s = int(time.time())
@@ -1483,11 +1557,6 @@ def refresh_minute_buffer(sym: str):
 # ── resampling for charts ─────────────────────────────────────────────────────
 
 def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
-
-    """
-    Aggregates consecutive 1-minute OHLC bars into fixed-size
-    buckets of bucket_minutes each, aligned to UTC clock boundaries.
-    """
 
     if not bars:
         return []
@@ -1521,31 +1590,21 @@ def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
 
 # ── minute-trigger engine ─────────────────────────────────────────────────────
 
-def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
+def evaluate_trigger(sym: str, now_utc: datetime.datetime):
 
     """
-    The core per-minute logic for one symbol:
+    Runs for EVERY symbol, failed or not:
+      1. Refresh the buffer.
+      2. Look at the latest closed candle (skip if already seen).
+      3. Determine reference window off current budget.
+      4. Determine whether it's a trigger.
 
-      1. Ensure today's daily budget accrual has happened.
-      2. Refresh the symbol's rolling 1-minute candle buffer.
-      3. Look at the latest closed candle. If already processed,
-         skip.
-      4. Pick reference window based on current running budget.
-      5. If the candle's low <= reference low, it's a trigger:
-         stack $1 into the accumulator, record trigger stat.
-      6. If the accumulator's contract-equivalent at the candle's
-         low >= exchange minimum, attempt a real order at that
-         price for the full accumulated amount. Record the attempt
-         (success or failure) for the daily report. On success,
-         reset accumulator and subtract from running budget.
+    Returns (candle_dt, candle_low, ref_label, triggered) or None if
+    there's nothing new to evaluate this minute.
+
+    Does NOT touch budget, accumulator, or orders — callers decide
+    what to do with a trigger based on failed status.
     """
-
-    if is_failed(sym):
-        return
-
-    today = now_utc.date()
-
-    accrue_daily_budget_if_due(sym, today)
 
     refresh_minute_buffer(sym)
 
@@ -1560,17 +1619,14 @@ def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
             "— skipping this minute"
         )
 
-        return
+        return None
 
-    candle_dt = datetime.datetime.fromtimestamp(
-        latest["t"], tz=UTC
-    )
+    candle_dt = datetime.datetime.fromtimestamp(latest["t"], tz=UTC)
 
     last_seen = get_last_seen_minute(sym)
 
     if last_seen is not None and candle_dt <= last_seen:
-
-        return
+        return None
 
     set_last_seen_minute(sym, candle_dt)
 
@@ -1594,7 +1650,7 @@ def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
             f"{ref_label} low — skipping this minute"
         )
 
-        return
+        return None
 
     triggered = candle_low <= ref_low
 
@@ -1603,13 +1659,58 @@ def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
         f"low={candle_low:.4f} "
         f"{ref_label}Low={ref_low:.4f} "
         f"budget={budget:.2f} "
+        f"failed={is_failed(sym)} "
         f"trigger={triggered}"
     )
+
+    return candle_dt, candle_low, ref_label, triggered
+
+
+def process_symbol_minute(sym: str, now_utc: datetime.datetime):
+
+    """
+    Top-level per-symbol per-minute entry point. Runs for every
+    symbol, failed or not.
+
+    FAILED symbols: evaluate trigger only, record a marker for
+    charting if triggered, and stop — never touch budget/
+    accumulator/orders.
+
+    NON-FAILED symbols: full trading path — accrue budget, evaluate
+    trigger, stack accumulator, attempt order if threshold reached.
+    """
+
+    failed = is_failed(sym)
+
+    if not failed:
+
+        today = now_utc.date()
+
+        accrue_daily_budget_if_due(sym, today)
+
+    result = evaluate_trigger(sym, now_utc)
+
+    if result is None:
+        return
+
+    candle_dt, candle_low, ref_label, triggered = result
 
     if not triggered:
         return
 
-    record_trigger_stat(sym, today)
+    # Every trigger, failed or not, gets logged for chart markers
+    # and counted in the daily stats trigger count.
+    record_trigger_marker(sym, candle_dt, candle_low, ref_label)
+    record_trigger_stat(sym)
+
+    if failed:
+
+        log.info(
+            f"[{sym}] TRIGGER (failed symbol, marker-only, "
+            f"no accumulation) @ price={candle_low:.4f}"
+        )
+
+        return
 
     pending = add_trigger_dollar(sym)
 
@@ -1644,9 +1745,7 @@ def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
 
     if oid == "SKIP" or oid is None:
 
-        record_attempt_stat(
-            sym, today, candle_low, success=False
-        )
+        record_attempt_stat(sym, candle_low, success=False)
 
         if oid == "SKIP":
 
@@ -1665,9 +1764,7 @@ def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
 
         return
 
-    record_attempt_stat(
-        sym, today, candle_low, success=True, usd_if_success=pending
-    )
+    record_attempt_stat(sym, candle_low, success=True, usd_if_success=pending)
 
     reset_accumulator(sym)
 
@@ -1686,11 +1783,17 @@ def process_symbol_minute_check(sym: str, now_utc: datetime.datetime):
 
 def run_minute_checks(now_utc: datetime.datetime):
 
+    """
+    Runs for EVERY symbol, failed or not — failed symbols are
+    evaluated for trigger-marking/charting purposes but never
+    trade. See process_symbol_minute.
+    """
+
     for sym in SYMBOLS:
 
         try:
 
-            process_symbol_minute_check(sym, now_utc)
+            process_symbol_minute(sym, now_utc)
 
         except Exception as e:
 
@@ -1702,28 +1805,49 @@ def run_minute_checks(now_utc: datetime.datetime):
 
 # ── daily activity report ─────────────────────────────────────────────────────
 
-def build_daily_report_text(today: datetime.date) -> str:
+def build_daily_report_text(now_utc: datetime.datetime) -> str:
 
-    lines = [
-        f"Daily Activity Report — {today.isoformat()} "
-        f"(as of {REPORT_HOUR_UTC:02d}:{REPORT_MINUTE_UTC:02d} UTC)",
-        "",
-    ]
+    window_start = None
 
     for sym in SYMBOLS:
 
-        if is_failed(sym):
+        stats = get_daily_stats_snapshot(sym)
 
-            lines.append(f"{sym}: FAILED — excluded from trading")
+        ws = _safe_ts(stats.get("window_start"))
 
-            continue
+        if ws is not None:
+            window_start = ws
+            break
 
-        stats = get_daily_stats_snapshot(sym, today)
+    if window_start is not None:
+
+        window_start_dt = datetime.datetime.fromtimestamp(
+            window_start, tz=UTC
+        )
+
+        header = (
+            f"Daily Activity Report — "
+            f"{window_start_dt.strftime('%Y-%m-%d %H:%M')} UTC "
+            f"to {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
+    else:
+
+        header = (
+            f"Daily Activity Report — as of "
+            f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
+    lines = [header, ""]
+
+    for sym in SYMBOLS:
+
+        stats = get_daily_stats_snapshot(sym)
 
         triggers = stats["triggers"]
         order_value = stats["order_value_usd"]
         ok = stats["orders_ok"]
-        failed = stats["orders_failed"]
+        failed_count = stats["orders_failed"]
         attempt_count = stats["attempt_count"]
         attempt_sum = stats["attempt_price_sum"]
 
@@ -1737,11 +1861,14 @@ def build_daily_report_text(today: datetime.date) -> str:
             f"{avg_price:,.4f}" if avg_price is not None else "n/a"
         )
 
+        excluded_note = " [EXCLUDED — not traded]" if is_failed(sym) else ""
+
         lines.append(
             f"{sym}: triggers={triggers}  "
             f"order_value=${order_value:,.2f}  "
-            f"ok={ok}  failed={failed}  "
+            f"ok={ok}  failed={failed_count}  "
             f"avg_attempt_price={avg_price_str}"
+            f"{excluded_note}"
         )
 
     return "\n".join(lines)
@@ -1750,13 +1877,12 @@ def build_daily_report_text(today: datetime.date) -> str:
 def maybe_send_daily_report(now_utc: datetime.datetime):
 
     """
-    Sends the daily activity report exactly once per UTC calendar
-    date, at/after REPORT_HOUR_UTC:REPORT_MINUTE_UTC. Idempotent via
-    a persisted last-report-date, so a restart near the report time
-    cannot cause a duplicate send.
+    Sends the daily activity report at/after REPORT_HOUR_UTC:
+    REPORT_MINUTE_UTC, but only if at least REPORT_MIN_INTERVAL_HOURS
+    have passed since the last successful send. On success, resets
+    every symbol's daily counters so the next report's window starts
+    now.
     """
-
-    today = now_utc.date()
 
     at_or_after_report_time = (
         (now_utc.hour, now_utc.minute)
@@ -1766,32 +1892,39 @@ def maybe_send_daily_report(now_utc: datetime.datetime):
     if not at_or_after_report_time:
         return
 
-    if get_last_report_date() == today:
-        return
+    last_sent = get_last_report_sent_at()
 
-    report_text = build_daily_report_text(today)
+    if last_sent is not None:
+
+        hours_since = (now_utc - last_sent).total_seconds() / 3600.0
+
+        if hours_since < REPORT_MIN_INTERVAL_HOURS:
+            return
+
+    report_text = build_daily_report_text(now_utc)
 
     log.info(f"sending daily activity report:\n{report_text}")
 
-    ntfy_send(
+    sent_ok = ntfy_send(
         report_text,
-        title=f"DCA Bot Daily Report {today.isoformat()}"
+        title=f"DCA Bot Daily Report {now_utc.date().isoformat()}"
     )
 
-    set_last_report_date(today)
+    if sent_ok:
+
+        set_last_report_sent_at(now_utc)
+
+        reset_daily_stats_all(now_utc)
+
+    else:
+
+        log.error(
+            "daily report send failed — counters NOT reset, "
+            "will retry next minute"
+        )
 
 
 # ── startup test orders ───────────────────────────────────────────────────────
-#
-# No threads. Three flat phases across the whole symbol batch:
-#   1. OPEN  — send a test limit LONG for every symbol, back to back
-#   2. WAIT  — sleep once, for TEST_ORDER_WAIT_SEC, for the whole batch
-#   3. CLOSE — check fill status and cancel/confirm for every symbol,
-#              back to back
-#
-# Any symbol that fails at any phase is flagged failed and excluded
-# from the minute-trigger engine entirely. A symbol whose test order
-# fills during the wait is NOT a failure.
 
 def _open_test_order(sym: str) -> Optional[Dict]:
 
@@ -2003,27 +2136,7 @@ def render_svg(now_utc: datetime.datetime) -> str:
 
     for sym in SYMBOLS:
 
-        if is_failed(sym):
-
-            line = (
-                f"{sym:<16} "
-                "*** FAILED STARTUP TEST — "
-                "EXCLUDED FROM TRADING ***"
-            )
-
-            svg.append(
-                f'<text x="20" y="{y}" '
-                f'font-family="Courier New" '
-                f'font-size="11" '
-                f'font-weight="bold" '
-                f'fill="#cc0000">'
-                f'{line}'
-                f'</text>'
-            )
-
-            y += 30
-
-            continue
+        failed = is_failed(sym)
 
         budget = get_budget(sym)
         accum = get_accumulator(sym)
@@ -2043,18 +2156,31 @@ def render_svg(now_utc: datetime.datetime) -> str:
             if o.get("symbol") == sym and "reference_window" in o
         )
 
-        clr = "#1155cc" if budget >= 0 else "#cc7a00"
+        if failed:
 
-        line = (
-            f"{sym:<16} "
-            f"budget=${budget:>8,.2f}  "
-            f"accum=${accum:>5,.2f}  "
-            f"ref={ref}  "
-            f"2dLow={low2d_str:>12}  "
-            f"9dLow={low9d_str:>12}  "
-            f"fires={n_orders:>4}  "
-            f"buf={buf.size():>6}m"
-        )
+            clr = "#cc0000"
+
+            line = (
+                f"{sym:<16} "
+                "*** FAILED — EXCLUDED FROM TRADING "
+                "(chart & triggers still tracked) ***  "
+                f"2dLow={low2d_str:>12}  9dLow={low9d_str:>12}"
+            )
+
+        else:
+
+            clr = "#1155cc" if budget >= 0 else "#cc7a00"
+
+            line = (
+                f"{sym:<16} "
+                f"budget=${budget:>8,.2f}  "
+                f"accum=${accum:>5,.2f}  "
+                f"ref={ref}  "
+                f"2dLow={low2d_str:>12}  "
+                f"9dLow={low9d_str:>12}  "
+                f"fires={n_orders:>4}  "
+                f"buf={buf.size():>6}m"
+            )
 
         svg.append(
             f'<text x="20" y="{y}" '
@@ -2075,6 +2201,13 @@ def render_svg(now_utc: datetime.datetime) -> str:
 # ── per-symbol chart SVG ───────────────────────────────────────────────────────
 
 def render_symbol_chart_svg(sym: str) -> str:
+
+    """
+    Rendered for EVERY symbol, failed or not. Failed symbols get
+    the same candlesticks and threshold line, but only ever show
+    trigger tick-markers (never order circles, since none are ever
+    attempted).
+    """
 
     buf = MINUTE_BUFFERS[sym]
 
@@ -2098,6 +2231,8 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'font-size="14" fill="#888">'
             f'{sym}: no chart data yet</text></svg>'
         )
+
+    failed = is_failed(sym)
 
     budget = get_budget(sym)
 
@@ -2133,6 +2268,8 @@ def render_symbol_chart_svg(sym: str) -> str:
 
     now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
+    title_suffix = " [FAILED — excluded from trading]" if failed else ""
+
     svg = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         (
@@ -2144,8 +2281,8 @@ def render_symbol_chart_svg(sym: str) -> str:
         (
             f'<text x="{CHART_MARGIN_L}" y="20" '
             f'font-family="Courier New" font-size="13" '
-            f'fill="#333" font-weight="bold">'
-            f'{sym} — 10d, 15m candles — {now_str}</text>'
+            f'fill="{"#cc0000" if failed else "#333"}" font-weight="bold">'
+            f'{sym} — 10d, 15m candles — {now_str}{title_suffix}</text>'
         ),
     ]
 
@@ -2214,6 +2351,40 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'fill="{color}"/>'
         )
 
+    # Trigger markers — small X ticks, shown for every symbol
+    # (failed or not) at every recorded trigger within the chart
+    # window.
+    trigger_markers = [
+        t for t in STATE_DATA["triggers"]
+        if t.get("symbol") == sym
+    ]
+
+    for t in trigger_markers:
+
+        ts = _safe_ts(t.get("candle_time"))
+
+        if ts is None or ts < t0 or ts > t1:
+            continue
+
+        tx = x_of(int(ts))
+        ty = y_of(t["price"])
+
+        sz = 3.5
+
+        svg.append(
+            f'<line x1="{tx - sz:.1f}" y1="{ty - sz:.1f}" '
+            f'x2="{tx + sz:.1f}" y2="{ty + sz:.1f}" '
+            f'stroke="#7a3fb8" stroke-width="1.3"/>'
+        )
+
+        svg.append(
+            f'<line x1="{tx - sz:.1f}" y1="{ty + sz:.1f}" '
+            f'x2="{tx + sz:.1f}" y2="{ty - sz:.1f}" '
+            f'stroke="#7a3fb8" stroke-width="1.3"/>'
+        )
+
+    # Order markers — filled circles, only ever present for
+    # non-failed symbols since failed symbols never call place_long.
     orders = [
         o for o in STATE_DATA["orders"]
         if o.get("symbol") == sym
@@ -2224,18 +2395,12 @@ def render_symbol_chart_svg(sym: str) -> str:
     for o in orders:
 
         ts_str = o.get("candle_time") or o.get("timestamp")
+        ts = _safe_ts(ts_str)
 
-        try:
-            odt = datetime.datetime.fromisoformat(ts_str)
-        except Exception:
+        if ts is None or ts < t0 or ts > t1:
             continue
 
-        ot = int(odt.timestamp())
-
-        if ot < t0 or ot > t1:
-            continue
-
-        ox = x_of(ot)
+        ox = x_of(int(ts))
         oy = y_of(o["limit_price"])
 
         is_real_fire = "reference_window" in o
@@ -2246,6 +2411,35 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'<circle cx="{ox:.1f}" cy="{oy:.1f}" r="4" '
             f'fill="{marker_color}" stroke="#fff" stroke-width="1"/>'
         )
+
+    # Legend
+    legend_y = CHART_H - 8
+
+    svg.append(
+        f'<line x1="{CHART_MARGIN_L}" y1="{legend_y - 4}" '
+        f'x2="{CHART_MARGIN_L + 8}" y2="{legend_y + 4}" '
+        f'stroke="#7a3fb8" stroke-width="1.3"/>'
+    )
+    svg.append(
+        f'<line x1="{CHART_MARGIN_L}" y1="{legend_y + 4}" '
+        f'x2="{CHART_MARGIN_L + 8}" y2="{legend_y - 4}" '
+        f'stroke="#7a3fb8" stroke-width="1.3"/>'
+    )
+    svg.append(
+        f'<text x="{CHART_MARGIN_L + 14}" y="{legend_y + 4}" '
+        f'font-family="Courier New" font-size="10" fill="#555">'
+        f'trigger</text>'
+    )
+
+    svg.append(
+        f'<circle cx="{CHART_MARGIN_L + 90}" cy="{legend_y}" r="4" '
+        f'fill="#0044cc" stroke="#fff" stroke-width="1"/>'
+    )
+    svg.append(
+        f'<text x="{CHART_MARGIN_L + 100}" y="{legend_y + 4}" '
+        f'font-family="Courier New" font-size="10" fill="#555">'
+        f'order placed</text>'
+    )
 
     svg.append(
         f'<rect x="{CHART_MARGIN_L}" y="{CHART_MARGIN_T}" '
@@ -2278,18 +2472,17 @@ def engine_cycle():
 
     now_utc = datetime.datetime.now(UTC)
 
-    # Trading logic first — never delayed by chart rendering or
+    # Trading (and trigger-evaluation, for ALL symbols including
+    # failed ones) first — never delayed by chart rendering or
     # report sending.
     run_minute_checks(now_utc)
 
     svg = render_svg(now_utc)
     STATE.set_svg(svg)
 
-    # Charts rendered AFTER trading logic, per symbol.
+    # Charts rendered AFTER trading logic, for EVERY symbol —
+    # failed symbols get charts too.
     for sym in SYMBOLS:
-
-        if is_failed(sym):
-            continue
 
         try:
 
@@ -2303,7 +2496,6 @@ def engine_cycle():
                 exc_info=True
             )
 
-    # Daily report check — also after trading logic, best-effort.
     try:
 
         maybe_send_daily_report(now_utc)
@@ -2335,14 +2527,11 @@ def run_engine():
     run_startup_test_orders()
 
     log.info(
-        "seeding 1-minute candle buffers "
-        f"(~{BUFFER_MAX_MINUTES} minutes each)"
+        "seeding 1-minute candle buffers for ALL symbols "
+        f"(including failed) (~{BUFFER_MAX_MINUTES} minutes each)"
     )
 
     for sym in SYMBOLS:
-
-        if is_failed(sym):
-            continue
 
         try:
 
@@ -2480,13 +2669,10 @@ class Handler(
 
         elif self.path == "/stats.json":
 
-            today = datetime.datetime.now(UTC).date()
-
             body = json.dumps(
                 {
-                    sym: get_daily_stats_snapshot(sym, today)
+                    sym: get_daily_stats_snapshot(sym)
                     for sym in SYMBOLS
-                    if not is_failed(sym)
                 },
                 indent=2
             ).encode("utf-8")
@@ -2505,7 +2691,11 @@ class Handler(
             status = STATE.get_status()
 
             chart_links = " · ".join(
-                f'<a href="/chart/{sym}.svg" target="_blank">{sym}</a>'
+                (
+                    f'<a href="/chart/{sym}.svg" target="_blank">'
+                    f'{sym}{" (failed)" if is_failed(sym) else ""}'
+                    f'</a>'
+                )
                 for sym in SYMBOLS
             )
 
@@ -2537,7 +2727,7 @@ class Handler(
                 " · "
                 "<a href='/budget.json'>budget/accumulator</a>"
                 " · "
-                "<a href='/stats.json'>today's stats</a>"
+                "<a href='/stats.json'>current stats</a>"
                 " · "
                 "<a href='/failed.json'>failed symbols</a>"
                 "</p>"
