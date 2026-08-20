@@ -2312,16 +2312,15 @@ def render_symbol_chart_svg(sym: str) -> str:
         y = y_of(price)
 
         svg.append(
-            f'<text x="{CHART_W - CHART_MARGIN_R - 4}" y="{ry - 4:.1f}" '
-            f'font-family="Courier New" font-size="10" '
-            f'fill="#cc0000" text-anchor="end">'
-            f'{_xml_escape(f"{ref_label} low threshold: {ref_low:,.4f}")}</text>'
+            f'<line x1="{CHART_MARGIN_L}" y1="{y:.1f}" '
+            f'x2="{CHART_W - CHART_MARGIN_R}" y2="{y:.1f}" '
+            f'stroke="#e0e0e0" stroke-width="1"/>'
         )
 
         svg.append(
             f'<text x="4" y="{y + 4:.1f}" '
             f'font-family="Courier New" font-size="9" '
-            f'fill="#888">{price:,.3f}</text>'
+            f'fill="#888">{_xml_escape(f"{price:,.3f}")}</text>'
         )
 
     if ref_low is not None:
@@ -2339,7 +2338,7 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'<text x="{CHART_W - CHART_MARGIN_R - 4}" y="{ry - 4:.1f}" '
             f'font-family="Courier New" font-size="10" '
             f'fill="#cc0000" text-anchor="end">'
-            f'{ref_label} low threshold: {ref_low:,.4f}</text>'
+            f'{_xml_escape(f"{ref_label} low threshold: {ref_low:,.4f}")}</text>'
         )
 
     candle_px_w = max(1.5, plot_w / len(candles) * 0.7)
