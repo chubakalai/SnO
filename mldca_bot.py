@@ -202,17 +202,15 @@ MEXC_BASE   = "https://api.mexc.co"
 # URNM_USDT      = Uranium
 
 SYMBOLS: List[str] = [
-    "USOIL_USDT",
-    "UKOIL_USDT",
-    "SPCXSTOCK_USDT",
-    "COPPER_USDT",
-    "SILVER_USDT",
-    "XAU_USDT",
-    "URNM_USDT",
-    "BTC_USDT",
-    "ETH_USDT",
-    "SOL_USDT",
-    "XRP_USDT",
+    "USOIL_USDT",      # proxy for UOILUSD (WTI)
+    "UKOIL_USDT",      # proxy for UKOILUSD (Brent)
+    "SPX500_USDT",     # proxy for SP500USD
+    "NAS100_USDT",     # proxy for NASDAQUSD
+    "URNM_USDT",       # proxy for URNMUSD
+    "BTC_USDT",        # proxy for BTCUSD
+    "ETH_USDT",        # proxy for ETHUSD
+    "SOL_USDT",        # proxy for SOLUSD
+    "XRP_USDT",        # proxy for XRPUSD
 ]
 
 LEVERAGE = 30
