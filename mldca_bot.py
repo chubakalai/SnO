@@ -209,6 +209,10 @@ SYMBOLS: List[str] = [
     "SILVER_USDT",
     "XAU_USDT",
     "URNM_USDT",
+    "BTC_USDT",
+    "ETH_USDT",
+    "SOL_USDT",
+    "XRP_USDT",
 ]
 
 LEVERAGE = 30
