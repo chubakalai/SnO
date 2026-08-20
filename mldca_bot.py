@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-MultiLongDCA-Bot — Multi-Symbol (USOIL_USDT WTI Crude +
-UKOIL_USDT Brent Crude + SPCXSTOCK_USDT) DCA Long Bot, each symbol priced and
+MultiLongDCA-Bot — Multi-Symbol DCA Long Bot, each symbol priced and
 sized independently at its own rolling 9-day low, each with its own
 independent budget and window.
 
@@ -13,36 +12,54 @@ window, its own fire history, its own 9-day-low computation.
 Nothing is pooled or shared across symbols except the process, the
 HTTP status server, and the state file.
 
+Symbols and their DCA parameters (budget / days / start date) are
+configured in one place — SYMBOL_CONFIG, near the top of this file.
+To add or remove a symbol, only edit SYMBOL_CONFIG.
+
 Behavior:
   - On startup: run a one-time TEST order (limit LONG at market-10%,
-    held 60s, then cancelled if unfilled) against EVERY symbol in
-    SYMBOLS, one at a time, sequentially, to validate the signing and
-    order-placement/cancellation path for each symbol's own specs
-    (tick size, min size) before the real engine loop begins. Each
-    symbol's test is independent — one symbol failing its test does
-    not stop the others from being tested or stop the engine loop
-    from starting afterward. This adds ~len(SYMBOLS) x
-    TEST_ORDER_WAIT_SEC to startup time (currently ~3 minutes for 3
-    symbols at 60s each).
+    sized at that symbol's own exchange-reported minimum order size)
+    against EVERY symbol in SYMBOLS, in three flat batch phases
+    (no per-symbol threads):
+
+      1. OPEN  — send a test limit LONG for every symbol, one after
+         another.
+      2. WAIT  — sleep once, for TEST_ORDER_WAIT_SEC seconds, for
+         the whole batch.
+      3. CLOSE — for every symbol that successfully opened, check
+         fill status and cancel if unfilled, one after another.
+
+    ANY failure at any phase — invalid/zero mark price, a rejected
+    order, a failed cancel, or any exception — flags that symbol as
+    FAILED for the remainder of this process's lifetime: it is
+    excluded from the daily DCA engine and shown in a visually
+    distinct flagged state on the SVG status page. A symbol whose
+    test order fills during the wait is NOT a failure — that's a
+    real open position, logged as such, and the symbol remains
+    validated and continues trading.
+
+    Total startup delay is roughly TEST_ORDER_WAIT_SEC plus the time
+    to fire off 2 x len(SYMBOLS) sequential HTTP requests — much
+    less than testing symbols one-at-a-time with a full wait each.
 
   - Every hour on the hour: refresh mark prices + rolling 9d lows
-    for all symbols and refresh the in-memory SVG status table.
+    for all non-failed symbols and refresh the in-memory SVG status
+    table (failed symbols are still shown, flagged, with no
+    mark/low refreshed).
 
-  - Only at hour == 00 UTC: for each symbol, if today's calendar
-    date falls within THAT SYMBOL'S OWN 90-day DCA window (per-symbol
-    start dates hardcoded below) AND that symbol has not already fired
-    today (per persisted fire-history), place a limit LONG priced AND
-    SIZED at that symbol's current trailing 9-day low (including
-    today's not-yet-closed bar via the daily klines fetch — see
-    rolling_9d_low) for that day's slice (that symbol's own budget /
-    that symbol's own DCA_DAYS).
+  - Only at hour == 00 UTC: for each symbol NOT flagged failed, if
+    today's calendar date falls within THAT SYMBOL'S OWN DCA window
+    (per-symbol start dates in SYMBOL_CONFIG) AND that symbol has
+    not already fired today (per persisted fire-history), place a
+    limit LONG priced AND SIZED at that symbol's current trailing
+    9-day low (including today's not-yet-closed bar via the daily
+    klines fetch — see rolling_9d_low) for that day's slice (that
+    symbol's own budget / that symbol's own DCA_DAYS).
 
     Each symbol's daily slice is computed from ITS OWN budget and day
     count (DCA_BUDGET_USD[sym] / DCA_DAYS[sym]), not a shared pool —
-    symbols can in principle run different budgets or different
-    windows without restructuring the code, though all three are
-    currently configured identically ($1000 / 90 days / starting
-    2026-08-10).
+    symbols can run different budgets or different windows without
+    restructuring the code.
 
     Sizing uses the 9d-low price (the limit price itself), NOT mark.
 
@@ -80,11 +97,16 @@ Behavior:
     fire history (symbol -> list of ISO dates already fired) is
     persisted to a local JSON file and checked before every fire.
 
+  - A restart also reruns the full startup test-order suite for
+    every symbol, including ones that failed before — FAILED_SYMBOLS
+    is in-memory only and is not persisted, so a symbol that failed
+    due to a transient issue can recover on the next restart.
+
   - Every placed order is logged (id, symbol, price, usd, contracts)
     and recorded into the same local JSON state file alongside fire
     history, so open orders can be cross-checked against MEXC's
     open-orders API at any time (see / status page, /orders.json,
-    and logs).
+    /failed.json, and logs).
 
 No CLI arguments. No config files beyond the state file (which stores
 history/records, not config). No web UI for configuration. All
@@ -95,13 +117,6 @@ SVG and a minimal HTML wrapper page.
 Environment (secrets only, not behavior):
   MEXC        - MEXC API key
   MEXCSECRET  - MEXC API secret
-
-SYMBOLS:
-  USOIL_USDT       - WTI Crude Oil
-  UKOIL_USDT       - Brent Crude Oil
-  SPCXSTOCK_USDT   - SPCX
-
-All symbols are treated completely independently.
 
 IMPORTANT:
   Contract specifications are fetched live from MEXC at startup.
@@ -143,77 +158,87 @@ MEXC_SECRET = os.getenv("MEXCSECRET")
 MEXC_BASE   = "https://api.mexc.co"
 
 
-# ── symbols ────────────────────────────────────────────────────────────────────
+# ── symbol configuration ──────────────────────────────────────────────────────
 #
-# USOIL_USDT      = WTI Crude Oil
-# UKOIL_USDT      = Brent Crude Oil
-# SPCXSTOCK_USDT  = SPCX
+# Single source of truth for which symbols the bot trades and each
+# symbol's own independent DCA parameters. To add or remove a symbol,
+# only edit SYMBOL_CONFIG below — nothing else in the file needs to
+# change.
 #
-# Each symbol is completely independent.
-
-SYMBOLS = [
-    "USOIL_USDT",
-    "UKOIL_USDT",
-    "SPCXSTOCK_USDT",
-    "COPPER_USDT",
-    "SILVER_USDT",
-    "XAU_USDT",
-]
-
-
-LEVERAGE  = 30
-ROLL_DAYS = 9
-
-
-# ── DCA schedule ──────────────────────────────────────────────────────────────
+# Each symbol is completely independent: its own budget, its own
+# window, its own fire history, its own 9-day-low computation.
+# Nothing is pooled or shared across symbols except the process, the
+# HTTP status server, and the state file.
 #
-# Each symbol has its OWN independent budget and day count.
+# Fields:
+#   budget_usd  - total USD to deploy over the window
+#   days        - length of the DCA window, in days
+#   start_date  - first calendar date (UTC) eligible to fire
 #
-# Current configuration:
-#   USOIL_USDT      = $1000 / 90 days
-#   UKOIL_USDT      = $1000 / 90 days
-#   SPCXSTOCK_USDT  = $1000 / 90 days
-#
-# The dictionaries deliberately remain per-symbol so the schedules
-# can diverge later without restructuring the code.
+# USOIL_USDT     = WTI Crude Oil
+# UKOIL_USDT     = Brent Crude Oil
+# SPCXSTOCK_USDT = SPCX
+# COPPER_USDT    = Copper
+# SILVER_USDT    = Silver
+# XAU_USDT       = Gold
+# URNM_USDT      = Uranium
+
+SYMBOL_CONFIG: Dict[str, Dict] = {
+    "USOIL_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+    "UKOIL_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+    "SPCXSTOCK_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+    "COPPER_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+    "SILVER_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+    "XAU_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+    "URNM_USDT": {
+        "budget_usd": 1000.0,
+        "days": 90,
+        "start_date": datetime.date(2026, 8, 10),
+    },
+}
+
+# Derived — do not edit directly. Change SYMBOL_CONFIG instead.
+SYMBOLS: List[str] = list(SYMBOL_CONFIG.keys())
 
 DCA_BUDGET_USD: Dict[str, float] = {
-    "USOIL_USDT": 1000.0,
-    "UKOIL_USDT": 1000.0,
-    "SPCXSTOCK_USDT": 1000.0,
-    "COPPER_USDT": 1000.0,
-    "SILVER_USDT": 1000.0,
-    "XAU_USDT": 1000.0,
+    sym: cfg["budget_usd"] for sym, cfg in SYMBOL_CONFIG.items()
 }
-
 
 DCA_DAYS: Dict[str, int] = {
-    "USOIL_USDT": 90,
-    "UKOIL_USDT": 90,
-    "SPCXSTOCK_USDT": 90,
-    "COPPER_USDT": 90,
-    "SILVER_USDT": 90,
-    "XAU_USDT": 90,
+    sym: cfg["days"] for sym, cfg in SYMBOL_CONFIG.items()
 }
 
+DCA_START_DATE: Dict[str, datetime.date] = {
+    sym: cfg["start_date"] for sym, cfg in SYMBOL_CONFIG.items()
+}
 
 DCA_DAILY_USD: Dict[str, float] = {
     sym: DCA_BUDGET_USD[sym] / DCA_DAYS[sym]
     for sym in SYMBOLS
-}
-
-
-# ── per-symbol DCA start dates ────────────────────────────────────────────────
-#
-# All three currently start on 2026-08-10.
-
-DCA_START_DATE: Dict[str, datetime.date] = {
-    "USOIL_USDT": datetime.date(2026, 8, 10),
-    "UKOIL_USDT": datetime.date(2026, 8, 10),
-    "SPCXSTOCK_USDT": datetime.date(2026, 8, 10),
-    "COPPER_USDT": datetime.date(2026, 8, 10),
-    "SILVER_USDT": datetime.date(2026, 8, 10),
-    "XAU_USDT": datetime.date(2026, 8, 10),
 }
 
 
@@ -223,16 +248,53 @@ def in_dca_window(sym: str, d: datetime.date) -> bool:
     return start <= d <= end
 
 
+LEVERAGE  = 30
+ROLL_DAYS = 9
+
+
 # ── timing ────────────────────────────────────────────────────────────────────
 
 HOURLY_SLEEP_FLOOR_SEC = 5
 
 
 # ── startup test order ────────────────────────────────────────────────────────
+#
+# All symbols are tested in one batch, three flat phases (open all,
+# wait once, close all) — no per-symbol threads, no per-symbol wait.
+#
+# Test orders are sized at each symbol's own exchange-reported
+# minimum order size (in contracts), not a fixed USD amount.
 
 TEST_ORDER_DISCOUNT = 0.90
-TEST_ORDER_WAIT_SEC = 60
-TEST_ORDER_USD      = 75.0
+TEST_ORDER_WAIT_SEC = 20
+
+
+# ── failed-symbol tracking ────────────────────────────────────────────────────
+#
+# Populated during startup test orders. Any symbol in this set is
+# excluded from the DCA engine and rendering treats it as flagged,
+# for the remainder of this process's lifetime. Resets on restart
+# (the whole test suite reruns on every startup).
+
+FAILED_SYMBOLS: set = set()
+_FAILED_LOCK = threading.Lock()
+
+
+def flag_failed(sym: str, reason: str):
+
+    with _FAILED_LOCK:
+        FAILED_SYMBOLS.add(sym)
+
+    log.error(
+        f"[{sym}] FLAGGED FAILED — {reason} — "
+        "excluded from DCA engine"
+    )
+
+
+def is_failed(sym: str) -> bool:
+
+    with _FAILED_LOCK:
+        return sym in FAILED_SYMBOLS
 
 
 # ── HTTP server ───────────────────────────────────────────────────────────────
@@ -313,7 +375,7 @@ def load_state() -> Dict:
             "fired": {
                 "USOIL_USDT": ["2026-08-10", ...],
                 "UKOIL_USDT": ["2026-08-10", ...],
-                "SPCXSTOCK_USDT": ["2026-08-10", ...]
+                ...
             },
             "orders": [...]
         }
@@ -378,6 +440,7 @@ def save_state(state: Dict):
 
 
 STATE_DATA: Dict = load_state()
+_STATE_DATA_LOCK = threading.Lock()
 
 
 def has_fired_today(
@@ -394,13 +457,30 @@ def mark_fired(
     order_record: Dict
 ):
 
-    STATE_DATA["fired"].setdefault(sym, []).append(
-        d.isoformat()
-    )
+    with _STATE_DATA_LOCK:
 
-    STATE_DATA["orders"].append(order_record)
+        STATE_DATA["fired"].setdefault(sym, []).append(
+            d.isoformat()
+        )
 
-    save_state(STATE_DATA)
+        STATE_DATA["orders"].append(order_record)
+
+        save_state(STATE_DATA)
+
+
+def record_order_only(order_record: Dict):
+
+    """
+    Record an order (e.g. a startup test order that filled) into
+    the state file's order log without marking any symbol as fired
+    for DCA purposes.
+    """
+
+    with _STATE_DATA_LOCK:
+
+        STATE_DATA["orders"].append(order_record)
+
+        save_state(STATE_DATA)
 
 
 def fired_count(sym: str) -> int:
@@ -553,6 +633,10 @@ def load_specs():
       - contractSize
 
     The live MEXC contract detail response is authoritative.
+
+    A symbol whose specs cannot be loaded is flagged failed rather
+    than aborting the whole process, so other symbols can still
+    trade.
     """
 
     rows = (
@@ -565,33 +649,36 @@ def load_specs():
     if not rows:
 
         log.error(
-            "empty contract detail response from MEXC"
+            "empty contract detail response from MEXC — "
+            "flagging all symbols failed"
         )
 
-        raise SystemExit(1)
+        for sym in SYMBOLS:
+
+            flag_failed(
+                sym,
+                "empty contract detail response from MEXC"
+            )
+
+        return
 
     by_sym = {
         c.get("symbol", "").upper(): c
         for c in rows
     }
 
-    missing = [
-        s for s in SYMBOLS
-        if s not in by_sym
-    ]
-
-    if missing:
-
-        log.error(
-            "symbols not found in MEXC "
-            f"contract detail: {missing}"
-        )
-
-        raise SystemExit(1)
-
     for sym in SYMBOLS:
 
-        match = by_sym[sym]
+        match = by_sym.get(sym)
+
+        if match is None:
+
+            flag_failed(
+                sym,
+                "symbol not found in MEXC contract detail"
+            )
+
+            continue
 
         vu = float(
             match.get("volUnit", 1)
@@ -711,6 +798,11 @@ def _contracts(
 
 def _mos(sym):
 
+    """
+    Minimum order size, in contracts, as reported by the exchange
+    (volUnit).
+    """
+
     return specs.get(
         sym,
         {}
@@ -774,7 +866,8 @@ def place_long(
 ) -> Optional[str]:
 
     """
-    Place a limit LONG / buy-to-open order.
+    Place a limit LONG / buy-to-open order, sized in USD notional
+    (converted to contracts via sizing_price).
 
     limit_price:
         Actual order limit price.
@@ -800,6 +893,40 @@ def place_long(
         )
 
         return "SKIP"
+
+    return _place_long_contracts(
+        sym,
+        limit_price,
+        vol
+    )
+
+
+def place_long_min_size(
+    sym: str,
+    limit_price: float
+) -> Optional[str]:
+
+    """
+    Place a limit LONG sized at exactly this symbol's own
+    exchange-reported minimum order size (contracts), regardless of
+    USD notional. Used for startup test orders so every symbol's
+    test is as small as the exchange allows.
+    """
+
+    vol = _mos(sym)
+
+    return _place_long_contracts(
+        sym,
+        limit_price,
+        vol
+    )
+
+
+def _place_long_contracts(
+    sym: str,
+    limit_price: float,
+    vol: float
+) -> Optional[str]:
 
     body = {
         "leverage": LEVERAGE,
@@ -860,9 +987,7 @@ def place_long(
         f"[{sym}] limit LONG "
         f"{_rfmt_vol(sym, vol)} "
         f"@ {_rfmt_price(sym, limit_price)} "
-        f"id={oid} "
-        f"usd={usd_amount:.2f} "
-        f"sizing_price={sizing_price:.4f}"
+        f"id={oid}"
     )
 
     return oid
@@ -1068,22 +1193,33 @@ def rolling_9d_low(
 
 
 # ── startup test orders ───────────────────────────────────────────────────────
+#
+# No threads. Three flat phases across the whole symbol batch:
+#   1. OPEN  — send a test limit LONG for every symbol, back to back
+#   2. WAIT  — sleep once, for TEST_ORDER_WAIT_SEC, for the whole batch
+#   3. CLOSE — check fill status and cancel/confirm for every symbol,
+#              back to back
+#
+# Any symbol that fails at any phase (invalid mark, rejected order,
+# cancel failure, or an exception) is flagged failed and excluded
+# from the DCA engine for the rest of this process's lifetime. A
+# symbol whose test order fills during the wait is NOT a failure —
+# it's a real position, logged as such, and the symbol stays
+# validated.
 
-def run_startup_test_order_for(
-    sym: str
-):
+def _open_test_order(sym: str) -> Optional[Dict]:
 
     """
-    Test the order-placement and cancellation
-    path independently for this symbol.
+    Phase 1 for one symbol: fetch mark, place the test order.
 
-    Places LONG at mark -10%, waits 60 seconds,
-    then cancels if still open.
+    Returns a dict describing the pending test order on success, or
+    None if the symbol was flagged failed during this phase.
     """
 
-    log.info(
-        f"── startup test order [{sym}]: begin ──"
-    )
+    if sym not in specs:
+
+        # Already flagged failed in load_specs().
+        return None
 
     try:
 
@@ -1091,59 +1227,75 @@ def run_startup_test_order_for(
 
         if mark <= 0:
 
-            log.error(
-                f"[{sym}] test order aborted: "
-                f"invalid mark price ({mark})"
+            flag_failed(
+                sym,
+                f"invalid mark price ({mark}) at startup test"
             )
 
-            return
+            return None
 
-        test_price = (
-            mark * TEST_ORDER_DISCOUNT
-        )
+        test_price = mark * TEST_ORDER_DISCOUNT
+        min_vol = _mos(sym)
 
         log.info(
-            f"[{sym}] test order: "
+            f"[{sym}] test order OPEN: "
             f"mark={mark:.4f} "
             f"limit={test_price:.4f} "
             f"(-{(1 - TEST_ORDER_DISCOUNT) * 100:.0f}%) "
-            f"usd={TEST_ORDER_USD:.2f}"
+            f"vol={min_vol} (exchange minimum)"
         )
 
-        oid = place_long(
+        oid = place_long_min_size(
             sym,
-            test_price,
-            mark,
-            TEST_ORDER_USD
+            test_price
         )
-
-        if oid == "SKIP":
-
-            log.warning(
-                f"[{sym}] test order skipped "
-                "— below minimum contract size"
-            )
-
-            return
 
         if oid is None:
 
-            log.error(
-                f"[{sym}] test order rejected "
-                "by MEXC"
+            flag_failed(
+                sym,
+                "test order rejected by MEXC"
             )
 
-            return
+            return None
 
         log.info(
-            f"[{sym}] test order placed "
-            f"id={oid} — waiting "
-            f"{TEST_ORDER_WAIT_SEC}s"
+            f"[{sym}] test order placed id={oid}"
         )
 
-        time.sleep(
-            TEST_ORDER_WAIT_SEC
+        return {
+            "sym": sym,
+            "oid": oid,
+            "limit_price": test_price,
+            "vol": min_vol,
+        }
+
+    except Exception as e:
+
+        flag_failed(
+            sym,
+            f"exception during test order open: {e}"
         )
+
+        log.error(
+            f"[{sym}] test order open failed: {e}",
+            exc_info=True
+        )
+
+        return None
+
+
+def _close_test_order(pending: Dict):
+
+    """
+    Phase 3 for one symbol: check fill status, cancel if unfilled,
+    flag failed if cancel fails.
+    """
+
+    sym = pending["sym"]
+    oid = pending["oid"]
+
+    try:
 
         if is_filled(sym, oid):
 
@@ -1152,58 +1304,104 @@ def run_startup_test_order_for(
                 f"FILLED during the "
                 f"{TEST_ORDER_WAIT_SEC}s wait. "
                 "This is now a real open long "
-                "position."
+                "position. Symbol remains validated."
+            )
+
+            record_order_only({
+                "symbol": sym,
+                "date": datetime.datetime.now(UTC).date().isoformat(),
+                "order_id": oid,
+                "kind": "startup_test_filled",
+                "limit_price": pending["limit_price"],
+                "vol": pending["vol"],
+            })
+
+            return
+
+        cancelled = cancel_order(
+            sym,
+            oid
+        )
+
+        if cancelled:
+
+            log.info(
+                f"[{sym}] test order id={oid} "
+                "cancelled successfully — symbol validated"
             )
 
         else:
 
-            cancelled = cancel_order(
+            flag_failed(
                 sym,
-                oid
+                f"test order id={oid} could not be cancelled"
             )
-
-            if cancelled:
-
-                log.info(
-                    f"[{sym}] test order "
-                    f"id={oid} cancelled successfully"
-                )
-
-            else:
-
-                log.error(
-                    f"[{sym}] test order "
-                    f"id={oid} could not be cancelled"
-                )
 
     except Exception as e:
 
-        log.error(
-            f"[{sym}] startup test order failed: "
-            f"{e}",
-            exc_info=True
+        flag_failed(
+            sym,
+            f"exception during test order close: {e}"
         )
 
-    log.info(
-        f"── startup test order [{sym}]: end ──"
-    )
+        log.error(
+            f"[{sym}] test order close failed: {e}",
+            exc_info=True
+        )
 
 
 def run_startup_test_orders():
 
+    """
+    Batch startup validation, three flat phases, no threads:
+
+      1. Send an OPEN test order for every symbol, one after another.
+      2. Sleep once for TEST_ORDER_WAIT_SEC, for the whole batch.
+      3. Send a CLOSE (fill-check + cancel) for every symbol that
+         successfully opened, one after another.
+
+    Total wall-clock time is roughly TEST_ORDER_WAIT_SEC plus the
+    time to fire off 2 x len(SYMBOLS) sequential requests — much
+    less than the old one-symbol-at-a-time design.
+    """
+
     log.info(
-        f"══ startup test orders: "
-        f"{len(SYMBOLS)} symbols, "
-        f"~{TEST_ORDER_WAIT_SEC}s each ══"
+        f"══ startup test orders: {len(SYMBOLS)} symbols — "
+        f"phase 1/3: opening ══"
     )
+
+    pending = []
 
     for sym in SYMBOLS:
 
-        run_startup_test_order_for(sym)
+        result = _open_test_order(sym)
+
+        if result is not None:
+
+            pending.append(result)
 
     log.info(
-        "══ startup test orders: "
-        "all symbols done ══"
+        f"══ startup test orders: {len(pending)}/{len(SYMBOLS)} "
+        f"opened — phase 2/3: waiting {TEST_ORDER_WAIT_SEC}s ══"
+    )
+
+    time.sleep(TEST_ORDER_WAIT_SEC)
+
+    log.info(
+        "══ startup test orders: phase 3/3: closing ══"
+    )
+
+    for p in pending:
+
+        _close_test_order(p)
+
+    ok = [s for s in SYMBOLS if not is_failed(s)]
+    failed = [s for s in SYMBOLS if is_failed(s)]
+
+    log.info(
+        "══ startup test orders: all symbols done — "
+        f"{len(ok)} ok, {len(failed)} failed "
+        f"{failed if failed else ''} ══"
     )
 
 
@@ -1214,7 +1412,7 @@ def run_daily_dca(
 ):
 
     """
-    Fire each eligible symbol independently.
+    Fire each eligible, non-failed symbol independently.
 
     The order is:
         LONG
@@ -1228,6 +1426,15 @@ def run_daily_dca(
     today = now_utc.date()
 
     for sym in SYMBOLS:
+
+        if is_failed(sym):
+
+            log.info(
+                f"[{sym}] skipped — flagged failed "
+                "at startup"
+            )
+
+            continue
 
         if not in_dca_window(
             sym,
@@ -1360,7 +1567,7 @@ def render_svg(
             f'font-size="13" '
             f'fill="#333" '
             f'font-weight="bold">'
-            f'MultiLongDCA-Bot — WTI + Brent + SPCX — '
+            f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
             f'own 9d-low pricing/sizing — {now_str}'
             f'</text>'
         ),
@@ -1369,6 +1576,28 @@ def render_svg(
     y = 50
 
     for sym in SYMBOLS:
+
+        if is_failed(sym):
+
+            line = (
+                f"{sym:<16} "
+                "*** FAILED STARTUP TEST — "
+                "EXCLUDED FROM TRADING ***"
+            )
+
+            svg.append(
+                f'<text x="20" y="{y}" '
+                f'font-family="Courier New" '
+                f'font-size="11" '
+                f'font-weight="bold" '
+                f'fill="#cc0000">'
+                f'{line}'
+                f'</text>'
+            )
+
+            y += 30
+
+            continue
 
         mark = marks.get(
             sym,
@@ -1499,14 +1728,19 @@ def engine_cycle():
         UTC
     )
 
+    active_symbols = [
+        sym for sym in SYMBOLS
+        if not is_failed(sym)
+    ]
+
     marks = {
         sym: get_mark(sym)
-        for sym in SYMBOLS
+        for sym in active_symbols
     }
 
     lows = {
         sym: rolling_9d_low(sym)
-        for sym in SYMBOLS
+        for sym in active_symbols
     }
 
     if now_utc.hour == 0:
@@ -1528,10 +1762,13 @@ def engine_cycle():
         for v in STATE_DATA["fired"].values()
     )
 
+    n_failed = len(FAILED_SYMBOLS)
+
     STATE.set_status(
         f"ok  "
         f"{now_utc.strftime('%Y-%m-%d %H:%M UTC')}  "
-        f"total_fires={n_fired_total}"
+        f"total_fires={n_fired_total}  "
+        f"failed_symbols={n_failed}"
     )
 
 
@@ -1655,6 +1892,31 @@ class Handler(
 
             self.wfile.write(body)
 
+        elif self.path == "/failed.json":
+
+            body = json.dumps(
+                sorted(FAILED_SYMBOLS),
+                indent=2
+            ).encode(
+                "utf-8"
+            )
+
+            self.send_response(200)
+
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(body))
+            )
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
         elif (
             self.path == "/"
             or self.path == ""
@@ -1679,8 +1941,7 @@ class Handler(
                 "<body>"
                 "<h3>"
                 "MultiLongDCA-Bot — "
-                "WTI + Brent + SPCX Multi-Symbol "
-                "DCA Long Bot"
+                "Multi-Symbol DCA Long Bot"
                 "</h3>"
                 f"<p>status: {status}</p>"
                 "<img src='/chart.svg' "
@@ -1688,6 +1949,10 @@ class Handler(
                 "<p>"
                 "<a href='/orders.json'>"
                 "order records (JSON)"
+                "</a>"
+                " · "
+                "<a href='/failed.json'>"
+                "failed symbols (JSON)"
                 "</a>"
                 "</p>"
                 "</body>"
