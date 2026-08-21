@@ -215,6 +215,9 @@ SYMBOLS: List[str] = [
     "NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium
     "NICKEL_USDT",     # Nickel
+    "COPPER_USDT",
+    "SILVER_USDT",
+    "XAU_USDT",
 ]
 
 LEVERAGE = 30
