@@ -220,7 +220,7 @@ SYMBOLS: List[str] = [
     "XAU_USDT",
 ]
 
-LEVERAGE = 30
+LEVERAGE = 20
 
 
 # ── minute-trigger engine constants ───────────────────────────────────────────
