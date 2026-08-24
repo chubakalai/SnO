@@ -218,6 +218,7 @@ SYMBOLS: List[str] = [
     "COPPER_USDT",
     "SILVER_USDT",
     "XAU_USDT",
+    "MSTRSTOCK_USDT",
 ]
 
 LEVERAGE = 20
