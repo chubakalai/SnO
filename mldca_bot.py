@@ -298,7 +298,7 @@ MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 
 BASE_TRIGGER_USD = 1.0   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
 
-CONTRIB_LOOKBACK_DAYS = 30
+CONTRIB_LOOKBACK_DAYS = 90
 
 
 # ── chart constants ────────────────────────────────────────────────────────────
