@@ -501,6 +501,20 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
 
     for sym in symbols:
         closes = fetch_30d_daily_closes(sym)
+        log.info(
+            f"[{sym}] contribution-weighting fetch: "
+            f"{n_candles} daily candles received "
+            f"(lookback={CONTRIB_LOOKBACK_DAYS}d)"
+        )
+
+        if n_candles < CONTRIB_LOOKBACK_DAYS:
+
+            log.warning(
+                f"[{sym}] fetched {n_candles} candles, short of the "
+                f"requested {CONTRIB_LOOKBACK_DAYS}d — MEXC may not "
+                "have that much history, or the request was "
+                "truncated/rate-limited"
+            )
         if closes:
             any_fetch_succeeded = True
         rets = compute_daily_returns(closes) if closes else []
