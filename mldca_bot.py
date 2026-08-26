@@ -2030,4 +2030,1253 @@ def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
 
     return out
 
+# ── minute-trigger engine ─────────────────────────────────────────────────────
 
+def evaluate_trigger(sym: str, now_utc: datetime.datetime):
+
+    """
+    Runs for EVERY symbol, failed or not:
+      1. Refresh the buffer.
+      2. Look at the latest closed candle (skip if already seen).
+      3. Determine reference window off current budget.
+      4. Determine whether it's a trigger.
+
+    Returns (candle_dt, candle_low, ref_label, triggered) or None if
+    there's nothing new to evaluate this minute.
+
+    Does NOT touch budget, accumulator, or orders — callers decide
+    what to do with a trigger based on failed status.
+    """
+
+    refresh_minute_buffer(sym)
+
+    buf = MINUTE_BUFFERS[sym]
+
+    latest = buf.latest_closed()
+
+    if latest is None:
+
+        log.warning(
+            f"[{sym}] no closed 1-minute candle available yet "
+            "— skipping this minute"
+        )
+
+        return None
+
+    candle_dt = datetime.datetime.fromtimestamp(latest["t"], tz=UTC)
+
+    last_seen = get_last_seen_minute(sym)
+
+    if last_seen is not None and candle_dt <= last_seen:
+        return None
+
+    set_last_seen_minute(sym, candle_dt)
+
+    candle_low = latest["l"]
+
+    budget = get_budget(sym)
+
+    if budget >= 0:
+        ref_window = ROLL_MINUTES_SHORT
+        ref_label = "2d"
+    else:
+        ref_window = ROLL_MINUTES_LONG
+        ref_label = "9d"
+
+    ref_low = buf.rolling_low(ref_window)
+
+    if ref_low is None:
+
+        log.warning(
+            f"[{sym}] insufficient buffer data to compute "
+            f"{ref_label} low — skipping this minute"
+        )
+
+        return None
+
+    triggered = candle_low <= ref_low
+
+    log.info(
+        f"[{sym}] minute check {candle_dt.isoformat()}: "
+        f"low={candle_low:.4f} "
+        f"{ref_label}Low={ref_low:.4f} "
+        f"budget={budget:.2f} "
+        f"failed={is_failed(sym)} "
+        f"trigger={triggered}"
+    )
+
+    return candle_dt, candle_low, ref_label, triggered
+
+
+def process_symbol_minute(sym: str, now_utc: datetime.datetime):
+
+    """
+    Top-level per-symbol per-minute entry point. Runs for every
+    symbol, failed or not.
+
+    FAILED symbols: evaluate trigger only, record a marker for
+    charting if triggered, and stop — never touch budget/
+    accumulator/orders.
+
+    NON-FAILED symbols: full trading path — accrue budget, evaluate
+    trigger, stack accumulator (at that symbol's CURRENT cached
+    per-trigger USD contribution — see add_trigger_dollar), attempt
+    order if threshold reached.
+    """
+
+    failed = is_failed(sym)
+
+    if not failed:
+
+        today = now_utc.date()
+
+        accrue_daily_budget_if_due(sym, today)
+
+    result = evaluate_trigger(sym, now_utc)
+
+    if result is None:
+        return
+
+    candle_dt, candle_low, ref_label, triggered = result
+
+    if not triggered:
+        return
+
+    # Every trigger, failed or not, gets logged for chart markers
+    # and counted in the daily stats trigger count.
+    record_trigger_marker(sym, candle_dt, candle_low, ref_label)
+    record_trigger_stat(sym)
+
+    if failed:
+
+        log.info(
+            f"[{sym}] TRIGGER (failed symbol, marker-only, "
+            f"no accumulation) @ price={candle_low:.4f}"
+        )
+
+        return
+
+    pending = add_trigger_dollar(sym)
+
+    log.info(
+        f"[{sym}] TRIGGER — accumulator now ${pending:.2f} "
+        f"(contribution=${get_contrib_per_trigger_usd(sym):.3f}/trigger) "
+        f"@ price={candle_low:.4f}"
+    )
+
+    vol_at_price = _contracts(sym, pending, candle_low)
+
+    if vol_at_price < _mos(sym):
+
+        log.info(
+            f"[{sym}] accumulator ${pending:.2f} still below "
+            f"min order size ({_mos(sym)} contracts @ "
+            f"{candle_low:.4f}) — stacking, no order placed"
+        )
+
+        return
+
+    log.info(
+        f"[{sym}] accumulator ${pending:.2f} reaches min order "
+        f"size — attempting limit LONG @ {candle_low:.4f}"
+    )
+
+    oid = place_long(
+        sym,
+        candle_low,
+        candle_low,
+        pending
+    )
+
+    if oid == "SKIP" or oid is None:
+
+        record_attempt_stat(sym, candle_low, success=False)
+
+        if oid == "SKIP":
+
+            log.warning(
+                f"[{sym}] fire skipped by place_long despite "
+                "passing pre-check — leaving accumulator intact"
+            )
+
+        else:
+
+            log.error(
+                f"[{sym}] minute-trigger order rejected by MEXC — "
+                "leaving accumulator intact, will retry on next "
+                "trigger"
+            )
+
+        return
+
+    record_attempt_stat(sym, candle_low, success=True, usd_if_success=pending)
+
+    reset_accumulator(sym)
+
+    spend_budget(sym, pending)
+
+    record_order({
+        "symbol": sym,
+        "timestamp": now_utc.isoformat(),
+        "candle_time": candle_dt.isoformat(),
+        "order_id": oid,
+        "limit_price": candle_low,
+        "usd": pending,
+        "reference_window": ref_label,
+    })
+
+
+def run_minute_checks(now_utc: datetime.datetime):
+
+    """
+    Runs for EVERY symbol, failed or not — failed symbols are
+    evaluated for trigger-marking/charting purposes but never
+    trade. See process_symbol_minute.
+    """
+
+    for sym in SYMBOLS:
+
+        try:
+
+            process_symbol_minute(sym, now_utc)
+
+        except Exception as e:
+
+            log.error(
+                f"[{sym}] minute check failed: {e}",
+                exc_info=True
+            )
+
+
+# ── daily activity report ─────────────────────────────────────────────────────
+
+def build_daily_report_text(now_utc: datetime.datetime) -> str:
+
+    window_start = None
+
+    for sym in SYMBOLS:
+
+        stats = get_daily_stats_snapshot(sym)
+
+        ws = _safe_ts(stats.get("window_start"))
+
+        if ws is not None:
+            window_start = ws
+            break
+
+    if window_start is not None:
+
+        window_start_dt = datetime.datetime.fromtimestamp(
+            window_start, tz=UTC
+        )
+
+        header = (
+            f"Daily Activity Report — "
+            f"{window_start_dt.strftime('%Y-%m-%d %H:%M')} UTC "
+            f"to {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
+    else:
+
+        header = (
+            f"Daily Activity Report — as of "
+            f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
+    contrib_date = get_contrib_last_computed_date()
+
+    contrib_note = (
+        f"Contribution weights last computed: {contrib_date.isoformat()}"
+        if contrib_date is not None
+        else "Contribution weights: not yet computed (flat fallback in effect)"
+    )
+
+    lines = [header, contrib_note, ""]
+
+    for sym in SYMBOLS:
+
+        stats = get_daily_stats_snapshot(sym)
+
+        triggers = stats["triggers"]
+        order_value = stats["order_value_usd"]
+        ok = stats["orders_ok"]
+        failed_count = stats["orders_failed"]
+        attempt_count = stats["attempt_count"]
+        attempt_sum = stats["attempt_price_sum"]
+
+        avg_price = (
+            attempt_sum / attempt_count
+            if attempt_count > 0
+            else None
+        )
+
+        avg_price_str = (
+            f"{avg_price:,.4f}" if avg_price is not None else "n/a"
+        )
+
+        excluded_note = " [EXCLUDED — not traded]" if is_failed(sym) else ""
+
+        contrib = get_contrib_per_trigger_usd(sym)
+
+        lines.append(
+            f"{sym}: triggers={triggers}  "
+            f"order_value=${order_value:,.2f}  "
+            f"ok={ok}  failed={failed_count}  "
+            f"avg_attempt_price={avg_price_str}  "
+            f"contrib/trigger=${contrib:.3f}"
+            f"{excluded_note}"
+        )
+
+    return "\n".join(lines)
+
+
+def maybe_send_daily_report(now_utc: datetime.datetime):
+
+    """
+    Sends the daily activity report at/after REPORT_HOUR_UTC:
+    REPORT_MINUTE_UTC, but only if at least REPORT_MIN_INTERVAL_HOURS
+    have passed since the last successful send. On success, resets
+    every symbol's daily counters so the next report's window starts
+    now.
+    """
+
+    at_or_after_report_time = (
+        (now_utc.hour, now_utc.minute)
+        >= (REPORT_HOUR_UTC, REPORT_MINUTE_UTC)
+    )
+
+    if not at_or_after_report_time:
+        return
+
+    last_sent = get_last_report_sent_at()
+
+    if last_sent is not None:
+
+        hours_since = (now_utc - last_sent).total_seconds() / 3600.0
+
+        if hours_since < REPORT_MIN_INTERVAL_HOURS:
+            return
+
+    report_text = build_daily_report_text(now_utc)
+
+    log.info(f"sending daily activity report:\n{report_text}")
+
+    sent_ok = ntfy_send(
+        report_text,
+        title=f"DCA Bot Daily Report {now_utc.date().isoformat()}"
+    )
+
+    if sent_ok:
+
+        set_last_report_sent_at(now_utc)
+
+        reset_daily_stats_all(now_utc)
+
+    else:
+
+        log.error(
+            "daily report send failed — counters NOT reset, "
+            "will retry next minute"
+        )
+
+
+# ── startup test orders ───────────────────────────────────────────────────────
+
+def _open_test_order(sym: str) -> Optional[Dict]:
+
+    if sym not in specs:
+
+        return None
+
+    try:
+
+        mark = get_mark(sym)
+
+        if mark <= 0:
+
+            flag_failed(
+                sym,
+                f"invalid mark price ({mark}) at startup test"
+            )
+
+            return None
+
+        test_price = mark * TEST_ORDER_DISCOUNT
+        min_vol = _mos(sym)
+
+        log.info(
+            f"[{sym}] test order OPEN: "
+            f"mark={mark:.4f} "
+            f"limit={test_price:.4f} "
+            f"(-{(1 - TEST_ORDER_DISCOUNT) * 100:.0f}%) "
+            f"vol={min_vol} (exchange minimum)"
+        )
+
+        oid = place_long_min_size(
+            sym,
+            test_price
+        )
+
+        if oid is None:
+
+            flag_failed(
+                sym,
+                "test order rejected by MEXC"
+            )
+
+            return None
+
+        log.info(
+            f"[{sym}] test order placed id={oid}"
+        )
+
+        return {
+            "sym": sym,
+            "oid": oid,
+            "limit_price": test_price,
+            "vol": min_vol,
+        }
+
+    except Exception as e:
+
+        flag_failed(
+            sym,
+            f"exception during test order open: {e}"
+        )
+
+        log.error(
+            f"[{sym}] test order open failed: {e}",
+            exc_info=True
+        )
+
+        return None
+
+
+def _close_test_order(pending: Dict):
+
+    sym = pending["sym"]
+    oid = pending["oid"]
+
+    try:
+
+        if is_filled(sym, oid):
+
+            log.warning(
+                f"[{sym}] test order id={oid} "
+                f"FILLED during the "
+                f"{TEST_ORDER_WAIT_SEC}s wait. "
+                "This is now a real open long "
+                "position. Symbol remains validated."
+            )
+
+            record_order({
+                "symbol": sym,
+                "timestamp": datetime.datetime.now(UTC).isoformat(),
+                "order_id": oid,
+                "kind": "startup_test_filled",
+                "limit_price": pending["limit_price"],
+                "vol": pending["vol"],
+            })
+
+            return
+
+        cancelled = cancel_order(
+            sym,
+            oid
+        )
+
+        if cancelled:
+
+            log.info(
+                f"[{sym}] test order id={oid} "
+                "cancelled successfully — symbol validated"
+            )
+
+        else:
+
+            flag_failed(
+                sym,
+                f"test order id={oid} could not be cancelled"
+            )
+
+    except Exception as e:
+
+        flag_failed(
+            sym,
+            f"exception during test order close: {e}"
+        )
+
+        log.error(
+            f"[{sym}] test order close failed: {e}",
+            exc_info=True
+        )
+
+
+def run_startup_test_orders():
+
+    log.info(
+        f"══ startup test orders: {len(SYMBOLS)} symbols — "
+        f"phase 1/3: opening ══"
+    )
+
+    pending = []
+
+    for sym in SYMBOLS:
+
+        result = _open_test_order(sym)
+
+        if result is not None:
+
+            pending.append(result)
+
+    log.info(
+        f"══ startup test orders: {len(pending)}/{len(SYMBOLS)} "
+        f"opened — phase 2/3: waiting {TEST_ORDER_WAIT_SEC}s ══"
+    )
+
+    time.sleep(TEST_ORDER_WAIT_SEC)
+
+    log.info(
+        "══ startup test orders: phase 3/3: closing ══"
+    )
+
+    for p in pending:
+
+        _close_test_order(p)
+
+    ok = [s for s in SYMBOLS if not is_failed(s)]
+    failed = [s for s in SYMBOLS if is_failed(s)]
+
+    log.info(
+        "══ startup test orders: all symbols done — "
+        f"{len(ok)} ok, {len(failed)} failed "
+        f"{failed if failed else ''} ══"
+    )
+
+
+# ── main overview SVG ─────────────────────────────────────────────────────────
+
+def render_svg(now_utc: datetime.datetime) -> str:
+
+    W = 1200
+    H = 60 + 30 * len(SYMBOLS)
+
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    contrib_date = get_contrib_last_computed_date()
+
+    contrib_date_str = (
+        contrib_date.isoformat() if contrib_date is not None else "pending"
+    )
+
+    title_text = _xml_escape(
+        f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
+        f'minute-trigger engine — {now_str} — '
+        f'contrib weights: {contrib_date_str}'
+    )
+
+    svg = [
+
+        '<?xml version="1.0" encoding="UTF-8"?>',
+
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {W} {H}" '
+            f'width="100%" '
+            f'style="max-width:{W}px;display:block">'
+        ),
+
+        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
+
+        (
+            f'<text x="20" y="24" '
+            f'font-family="Courier New" '
+            f'font-size="13" '
+            f'fill="#333" '
+            f'font-weight="bold">'
+            f'{title_text}'
+            f'</text>'
+        ),
+    ]
+
+    y = 50
+
+    for sym in SYMBOLS:
+
+        failed = is_failed(sym)
+
+        budget = get_budget(sym)
+        accum = get_accumulator(sym)
+        contrib = get_contrib_per_trigger_usd(sym)
+
+        buf = MINUTE_BUFFERS[sym]
+
+        low2d = buf.rolling_low(ROLL_MINUTES_SHORT)
+        low9d = buf.rolling_low(ROLL_MINUTES_LONG)
+
+        low2d_str = f"{low2d:,.4f}" if low2d is not None else "n/a"
+        low9d_str = f"{low9d:,.4f}" if low9d is not None else "n/a"
+
+        ref = "2d" if budget >= 0 else "9d"
+
+        n_orders = sum(
+            1 for o in STATE_DATA["orders"]
+            if o.get("symbol") == sym and "reference_window" in o
+        )
+
+        if failed:
+
+            clr = "#cc0000"
+
+            line = (
+                f"{sym:<16} "
+                "*** FAILED — EXCLUDED FROM TRADING "
+                "(chart & triggers still tracked) ***  "
+                f"2dLow={low2d_str:>12}  9dLow={low9d_str:>12}"
+            )
+
+        else:
+
+            clr = "#1155cc" if budget >= 0 else "#cc7a00"
+
+            line = (
+                f"{sym:<16} "
+                f"budget=${budget:>8,.2f}  "
+                f"accum=${accum:>5,.2f}  "
+                f"contrib=${contrib:>5,.3f}/trig  "
+                f"ref={ref}  "
+                f"2dLow={low2d_str:>12}  "
+                f"9dLow={low9d_str:>12}  "
+                f"fires={n_orders:>4}  "
+                f"buf={buf.size():>6}m"
+            )
+
+        svg.append(
+            f'<text x="20" y="{y}" '
+            f'font-family="Courier New" '
+            f'font-size="11" '
+            f'fill="{clr}">'
+            f'{_xml_escape(line)}'
+            f'</text>'
+        )
+
+        y += 30
+
+    svg.append("</svg>")
+
+    return "\n".join(svg)
+
+
+# ── per-symbol chart SVG ───────────────────────────────────────────────────────
+
+def render_symbol_chart_svg(sym: str) -> str:
+
+    """
+    Rendered for EVERY symbol, failed or not. Failed symbols get
+    the same candlesticks and threshold line, but only ever show
+    trigger tick-markers (never order circles, since none are ever
+    attempted).
+    """
+
+    buf = MINUTE_BUFFERS[sym]
+
+    bars_1m = buf.snapshot()
+
+    now_s = int(time.time())
+    cutoff = now_s - CHART_MINUTES * 60
+
+    bars_1m = [b for b in bars_1m if b["t"] >= cutoff]
+
+    candles = resample_ohlc(bars_1m, CHART_RESAMPLE_MIN)
+
+    if not candles:
+
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'width="{CHART_W}" height="{CHART_H}">'
+            f'<rect width="{CHART_W}" height="{CHART_H}" fill="#fafafa"/>'
+            f'<text x="20" y="40" font-family="Courier New" '
+            f'font-size="14" fill="#888">'
+            f'{sym}: no chart data yet</text></svg>'
+        )
+
+    failed = is_failed(sym)
+
+    budget = get_budget(sym)
+    contrib = get_contrib_per_trigger_usd(sym)
+
+    ref_window = ROLL_MINUTES_SHORT if budget >= 0 else ROLL_MINUTES_LONG
+    ref_label = "2d" if budget >= 0 else "9d"
+    ref_low = buf.rolling_low(ref_window)
+
+    lo = min(c["l"] for c in candles)
+    hi = max(c["h"] for c in candles)
+
+    if ref_low is not None:
+        lo = min(lo, ref_low)
+        hi = max(hi, ref_low)
+
+    span = (hi - lo) or 1.0
+
+    lo -= span * 0.05
+    hi += span * 0.05
+    span = hi - lo
+
+    plot_w = CHART_W - CHART_MARGIN_L - CHART_MARGIN_R
+    plot_h = CHART_H - CHART_MARGIN_T - CHART_MARGIN_B
+
+    t0 = candles[0]["t"]
+    t1 = candles[-1]["t"] + CHART_RESAMPLE_MIN * 60
+    t_span = (t1 - t0) or 1
+
+    def x_of(t: int) -> float:
+        return CHART_MARGIN_L + (t - t0) / t_span * plot_w
+
+    def y_of(price: float) -> float:
+        return CHART_MARGIN_T + (hi - price) / span * plot_h
+
+    now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+    title_suffix = _xml_escape(
+        (" [FAILED — excluded from trading]" if failed else "")
+        + f" [contrib: ${contrib:.3f}/trigger]"
+    )
+
+    svg = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {CHART_W} {CHART_H}" '
+            f'width="100%" style="max-width:{CHART_W}px;display:block">'
+        ),
+        f'<rect width="{CHART_W}" height="{CHART_H}" fill="#fafafa"/>',
+        (
+            f'<text x="{CHART_MARGIN_L}" y="20" '
+            f'font-family="Courier New" font-size="13" '
+            f'fill="{"#cc0000" if failed else "#333"}" font-weight="bold">'
+            f'{sym} — 10d, 15m candles — {now_str}{title_suffix}</text>'
+        ),
+    ]
+
+    for i in range(6):
+
+        price = lo + span * i / 5
+        y = y_of(price)
+
+        svg.append(
+            f'<line x1="{CHART_MARGIN_L}" y1="{y:.1f}" '
+            f'x2="{CHART_W - CHART_MARGIN_R}" y2="{y:.1f}" '
+            f'stroke="#e0e0e0" stroke-width="1"/>'
+        )
+
+        svg.append(
+            f'<text x="4" y="{y + 4:.1f}" '
+            f'font-family="Courier New" font-size="9" '
+            f'fill="#888">{_xml_escape(f"{price:,.3f}")}</text>'
+        )
+
+    if ref_low is not None:
+
+        ry = y_of(ref_low)
+
+        svg.append(
+            f'<line x1="{CHART_MARGIN_L}" y1="{ry:.1f}" '
+            f'x2="{CHART_W - CHART_MARGIN_R}" y2="{ry:.1f}" '
+            f'stroke="#cc0000" stroke-width="1.2" '
+            f'stroke-dasharray="6,3"/>'
+        )
+
+        svg.append(
+            f'<text x="{CHART_W - CHART_MARGIN_R - 4}" y="{ry - 4:.1f}" '
+            f'font-family="Courier New" font-size="10" '
+            f'fill="#cc0000" text-anchor="end">'
+            f'{_xml_escape(f"{ref_label} low threshold: {ref_low:,.4f}")}</text>'
+        )
+
+    candle_px_w = max(1.5, plot_w / len(candles) * 0.7)
+
+    for c in candles:
+
+        x = x_of(c["t"]) + (plot_w / len(candles)) / 2
+
+        up = c["c"] >= c["o"]
+        color = "#1a8a1a" if up else "#cc2200"
+
+        y_high = y_of(c["h"])
+        y_low = y_of(c["l"])
+
+        y_open = y_of(c["o"])
+        y_close = y_of(c["c"])
+
+        body_top = min(y_open, y_close)
+        body_h = max(1.0, abs(y_close - y_open))
+
+        svg.append(
+            f'<line x1="{x:.1f}" y1="{y_high:.1f}" '
+            f'x2="{x:.1f}" y2="{y_low:.1f}" '
+            f'stroke="{color}" stroke-width="1"/>'
+        )
+
+        svg.append(
+            f'<rect x="{x - candle_px_w / 2:.1f}" y="{body_top:.1f}" '
+            f'width="{candle_px_w:.1f}" height="{body_h:.1f}" '
+            f'fill="{color}"/>'
+        )
+
+    # Trigger markers — small X ticks, shown for every symbol
+    # (failed or not) at every recorded trigger within the chart
+    # window.
+    trigger_markers = [
+        t for t in STATE_DATA["triggers"]
+        if t.get("symbol") == sym
+    ]
+
+    for t in trigger_markers:
+
+        ts = _safe_ts(t.get("candle_time"))
+
+        if ts is None or ts < t0 or ts > t1:
+            continue
+
+        tx = x_of(int(ts))
+        ty = y_of(t["price"])
+
+        sz = 3.5
+
+        svg.append(
+            f'<line x1="{tx - sz:.1f}" y1="{ty - sz:.1f}" '
+            f'x2="{tx + sz:.1f}" y2="{ty + sz:.1f}" '
+            f'stroke="#7a3fb8" stroke-width="1.3"/>'
+        )
+
+        svg.append(
+            f'<line x1="{tx - sz:.1f}" y1="{ty + sz:.1f}" '
+            f'x2="{tx + sz:.1f}" y2="{ty - sz:.1f}" '
+            f'stroke="#7a3fb8" stroke-width="1.3"/>'
+        )
+
+    # Order markers — filled circles, only ever present for
+    # non-failed symbols since failed symbols never call place_long.
+    orders = [
+        o for o in STATE_DATA["orders"]
+        if o.get("symbol") == sym
+        and "limit_price" in o
+        and ("candle_time" in o or "timestamp" in o)
+    ]
+
+    for o in orders:
+
+        ts_str = o.get("candle_time") or o.get("timestamp")
+        ts = _safe_ts(ts_str)
+
+        if ts is None or ts < t0 or ts > t1:
+            continue
+
+        ox = x_of(int(ts))
+        oy = y_of(o["limit_price"])
+
+        is_real_fire = "reference_window" in o
+
+        marker_color = "#0044cc" if is_real_fire else "#888"
+
+        svg.append(
+            f'<circle cx="{ox:.1f}" cy="{oy:.1f}" r="4" '
+            f'fill="{marker_color}" stroke="#fff" stroke-width="1"/>'
+        )
+
+    # Legend
+    legend_y = CHART_H - 8
+
+    svg.append(
+        f'<line x1="{CHART_MARGIN_L}" y1="{legend_y - 4}" '
+        f'x2="{CHART_MARGIN_L + 8}" y2="{legend_y + 4}" '
+        f'stroke="#7a3fb8" stroke-width="1.3"/>'
+    )
+    svg.append(
+        f'<line x1="{CHART_MARGIN_L}" y1="{legend_y + 4}" '
+        f'x2="{CHART_MARGIN_L + 8}" y2="{legend_y - 4}" '
+        f'stroke="#7a3fb8" stroke-width="1.3"/>'
+    )
+    svg.append(
+        f'<text x="{CHART_MARGIN_L + 14}" y="{legend_y + 4}" '
+        f'font-family="Courier New" font-size="10" fill="#555">'
+        f'trigger</text>'
+    )
+
+    svg.append(
+        f'<circle cx="{CHART_MARGIN_L + 90}" cy="{legend_y}" r="4" '
+        f'fill="#0044cc" stroke="#fff" stroke-width="1"/>'
+    )
+    svg.append(
+        f'<text x="{CHART_MARGIN_L + 100}" y="{legend_y + 4}" '
+        f'font-family="Courier New" font-size="10" fill="#555">'
+        f'order placed</text>'
+    )
+
+    svg.append(
+        f'<rect x="{CHART_MARGIN_L}" y="{CHART_MARGIN_T}" '
+        f'width="{plot_w}" height="{plot_h}" '
+        f'fill="none" stroke="#999" stroke-width="1"/>'
+    )
+
+    svg.append("</svg>")
+
+    return "\n".join(svg)
+
+
+# ── engine timing ─────────────────────────────────────────────────────────────
+
+def _seconds_until_next_minute_mark() -> float:
+
+    now = time.time()
+
+    next_mark = (
+        (int(now) // 60 + 1) * 60
+        + MINUTE_CHECK_SECOND
+    )
+
+    return next_mark - now
+
+
+# ── engine cycle ─────────────────────────────────────────────────────────────
+
+def engine_cycle():
+
+    now_utc = datetime.datetime.now(UTC)
+
+    # Contribution-weighting recompute FIRST, if due — must have a
+    # value available before any trigger this cycle can call
+    # add_trigger_dollar(). Guarded internally to run at most once
+    # per UTC calendar day; a no-op on every other cycle.
+    try:
+
+        recompute_contributions_if_due(now_utc.date())
+
+    except Exception as e:
+
+        log.error(
+            f"contribution-weighting recompute check failed: {e}",
+            exc_info=True
+        )
+
+    # Trading (and trigger-evaluation, for ALL symbols including
+    # failed ones) next — never delayed by chart rendering or
+    # report sending.
+    run_minute_checks(now_utc)
+
+    svg = render_svg(now_utc)
+    STATE.set_svg(svg)
+
+    # Charts rendered AFTER trading logic, for EVERY symbol —
+    # failed symbols get charts too.
+    for sym in SYMBOLS:
+
+        try:
+
+            chart_svg = render_symbol_chart_svg(sym)
+            STATE.set_chart_svg(sym, chart_svg)
+
+        except Exception as e:
+
+            log.error(
+                f"[{sym}] chart render failed: {e}",
+                exc_info=True
+            )
+
+    try:
+
+        maybe_send_daily_report(now_utc)
+
+    except Exception as e:
+
+        log.error(
+            f"daily report check failed: {e}",
+            exc_info=True
+        )
+
+    n_orders = total_orders_count()
+    n_failed = len(FAILED_SYMBOLS)
+
+    STATE.set_status(
+        f"ok  "
+        f"{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}  "
+        f"total_orders={n_orders}  "
+        f"failed_symbols={n_failed}"
+    )
+
+
+# ── engine ────────────────────────────────────────────────────────────────────
+
+def run_engine():
+
+    load_specs()
+
+    run_startup_test_orders()
+
+    log.info(
+        "seeding 1-minute candle buffers for ALL symbols "
+        f"(including failed) (~{BUFFER_MAX_MINUTES} minutes each)"
+    )
+
+    for sym in SYMBOLS:
+
+        try:
+
+            seed_minute_buffer(sym)
+
+        except Exception as e:
+
+            log.error(
+                f"[{sym}] failed to seed minute buffer: {e}",
+                exc_info=True
+            )
+
+    log.info(
+        "engine starting — running initial cycle"
+    )
+
+    try:
+
+        engine_cycle()
+
+    except Exception as e:
+
+        log.error(
+            f"initial engine cycle failed: {e}",
+            exc_info=True
+        )
+
+        STATE.set_status(f"error: {e}")
+
+    while True:
+
+        wait_s = _seconds_until_next_minute_mark()
+
+        time.sleep(max(0, wait_s))
+
+        try:
+
+            engine_cycle()
+
+        except Exception as e:
+
+            log.error(
+                f"engine cycle failed: {e}",
+                exc_info=True
+            )
+
+            STATE.set_status(f"error: {e}")
+
+
+# ── HTTP server ───────────────────────────────────────────────────────────────
+
+class Handler(
+    http.server.BaseHTTPRequestHandler
+):
+
+    def log_message(
+        self,
+        fmt,
+        *args
+    ):
+
+        pass
+
+    def do_GET(self):
+
+        if self.path == "/chart.svg":
+
+            svg = STATE.get_svg().encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(svg)
+
+        elif self.path.startswith("/chart/") and self.path.endswith(".svg"):
+
+            sym = self.path[len("/chart/"):-len(".svg")]
+
+            if sym not in SYMBOLS:
+
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            svg = STATE.get_chart_svg(sym).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(svg)
+
+        elif self.path == "/orders.json":
+
+            body = json.dumps(
+                STATE_DATA["orders"], indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/failed.json":
+
+            body = json.dumps(
+                sorted(FAILED_SYMBOLS), indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/budget.json":
+
+            body = json.dumps(
+                {
+                    "budget": STATE_DATA["budget"],
+                    "accumulator": STATE_DATA["accumulator"],
+                    "contrib_per_trigger_usd": STATE_DATA["contrib_per_trigger_usd"],
+                    "contrib_last_computed_date": STATE_DATA["contrib_last_computed_date"],
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/stats.json":
+
+            body = json.dumps(
+                {
+                    sym: get_daily_stats_snapshot(sym)
+                    for sym in SYMBOLS
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif (
+            self.path == "/"
+            or self.path == ""
+        ):
+
+            status = STATE.get_status()
+
+            chart_links = " · ".join(
+                (
+                    f'<a href="/chart/{sym}.svg" target="_blank">'
+                    f'{sym}{" (failed)" if is_failed(sym) else ""}'
+                    f'</a>'
+                )
+                for sym in SYMBOLS
+            )
+
+            html = (
+                "<!doctype html>"
+                "<html>"
+                "<head>"
+                "<meta charset='utf-8'>"
+                "<meta http-equiv='refresh' content='60'>"
+                "<title>MultiLongDCA-Bot Overview</title>"
+                "<style>"
+                "body{font-family:monospace;"
+                "background:#fafafa;margin:24px}"
+                "img{max-width:100%;height:auto;"
+                "border:1px solid #ccc}"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<h3>"
+                "MultiLongDCA-Bot — "
+                "Multi-Symbol Minute-Trigger DCA Long Bot"
+                "</h3>"
+                f"<p>status: {status}</p>"
+                "<img src='/chart.svg' "
+                "alt='overview table'/>"
+                f"<p>charts: {chart_links}</p>"
+                "<p>"
+                "<a href='/orders.json'>order records</a>"
+                " · "
+                "<a href='/budget.json'>budget/accumulator/contribution</a>"
+                " · "
+                "<a href='/stats.json'>current stats</a>"
+                " · "
+                "<a href='/failed.json'>failed symbols</a>"
+                "</p>"
+                "</body>"
+                "</html>"
+            )
+
+            body = html.encode("utf-8")
+
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "text/html; charset=utf-8"
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
+
+            self.send_response(404)
+            self.end_headers()
+
+
+# ── HTTP server thread ────────────────────────────────────────────────────────
+
+def run_server():
+
+    server = http.server.ThreadingHTTPServer(
+        (HTTP_HOST, HTTP_PORT),
+        Handler
+    )
+
+    log.info(
+        f"server listening on {HTTP_HOST}:{HTTP_PORT}"
+    )
+
+    server.serve_forever()
+
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
+def main():
+
+    if not MEXC_KEY or not MEXC_SECRET:
+
+        log.error("MEXC / MEXCSECRET not set")
+
+        raise SystemExit(1)
+
+    server_thread = threading.Thread(
+        target=run_server,
+        daemon=True
+    )
+
+    server_thread.start()
+
+    run_engine()
+
+
+if __name__ == "__main__":
+
+    main()
