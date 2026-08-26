@@ -255,9 +255,9 @@ MEXC_BASE   = "https://api.mexc.co"
 
 SYMBOLS: List[str] = [
     "USOIL_USDT",      # proxy for UOILUSD (WTI)
-    "UKOIL_USDT",      # proxy for UKOILUSD (Brent)
-    "SPX500_USDT",     # proxy for SP500USD
-    "NAS100_USDT",     # proxy for NASDAQUSD
+    # "UKOIL_USDT",      # proxy for UKOILUSD (Brent)
+    # "SPX500_USDT",     # proxy for SP500USD
+    # "NAS100_USDT",     # proxy for NASDAQUSD
     "URNM_USDT",       # proxy for URNMUSD
     "BTC_USDT",        # proxy for BTCUSD
     "ETH_USDT",        # proxy for ETHUSD
@@ -266,9 +266,9 @@ SYMBOLS: List[str] = [
     "INDA_USDT",       # iShares MSCI India ETF
     "NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium
-    "NICKEL_USDT",     # Nickel
-    "COPPER_USDT",
-    "SILVER_USDT",
+    # "NICKEL_USDT",     # Nickel
+    # "COPPER_USDT",
+    # "SILVER_USDT",
     "XAU_USDT",
     "MSTRSTOCK_USDT",
 ]
