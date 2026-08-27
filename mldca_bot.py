@@ -238,26 +238,9 @@ MEXC_BASE   = "https://api.mexc.co"
 
 
 # ── symbol configuration ──────────────────────────────────────────────────────
-#
-# USOIL_USDT     = WTI Crude Oil
-# UKOIL_USDT     = Brent Crude Oil
-# SPX500_USDT    = S&P 500 proxy
-# NAS100_USDT    = Nasdaq 100 proxy
-# URNM_USDT      = Uranium
-# INDA_USDT      = iShares MSCI India ETF
-# NGAS_USDT      = Natural Gas
-# XPD_USDT       = Palladium
-# NICKEL_USDT    = Nickel
-# COPPER_USDT    = Copper
-# SILVER_USDT    = Silver
-# XAU_USDT       = Gold
-# MSTRSTOCK_USDT = MSTR stock proxy
 
 SYMBOLS: List[str] = [
     "USOIL_USDT",      # proxy for UOILUSD (WTI)
-    # "UKOIL_USDT",      # proxy for UKOILUSD (Brent)
-    # "SPX500_USDT",     # proxy for SP500USD
-    # "NAS100_USDT",     # proxy for NASDAQUSD
     "URNM_USDT",       # proxy for URNMUSD
     "BTC_USDT",        # proxy for BTCUSD
     "ETH_USDT",        # proxy for ETHUSD
@@ -266,11 +249,9 @@ SYMBOLS: List[str] = [
     "INDA_USDT",       # iShares MSCI India ETF
     "NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium
-    # "NICKEL_USDT",     # Nickel
-    # "COPPER_USDT",
-    # "SILVER_USDT",
     "XAU_USDT",
     "MSTRSTOCK_USDT",
+    "UNITREESTOCK_USDT",
 ]
 
 LEVERAGE = 20
@@ -290,11 +271,6 @@ MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 
 
 # ── contribution-weighting constants ──────────────────────────────────────────
-#
-# Per-trigger USD contribution is recomputed once per UTC calendar
-# day from a 30-day trailing daily-close correlation/volatility
-# analysis across all symbols in SYMBOLS. See module docstring,
-# "CONTRIBUTION WEIGHTING" section.
 
 BASE_TRIGGER_USD = 1.0   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
 
@@ -323,9 +299,6 @@ NTFY_URL       = f"https://ntfy.sh/{NTFY_TOPIC}"
 REPORT_HOUR_UTC   = 14
 REPORT_MINUTE_UTC = 0
 
-# Minimum time that must pass since the last successful send before
-# another can go out, even if we're past REPORT_HOUR_UTC again —
-# guards against double-send on restart near 14:00 UTC.
 REPORT_MIN_INTERVAL_HOURS = 20
 
 
@@ -341,26 +314,16 @@ TEST_ORDER_WAIT_SEC = 20
 
 
 # ── failed-symbol tracking ────────────────────────────────────────────────────
-#
-# FAILED excludes a symbol from TRADING ONLY (budget accrual,
-# accumulator, order attempts). It does NOT exclude charting or
-# buffer refresh or trigger evaluation — see module docstring.
 
 FAILED_SYMBOLS: set = set()
 _FAILED_LOCK = threading.Lock()
 
 
 def _xml_escape(s: str) -> str:
-    """
-    Escapes text for safe embedding inside SVG/XML text content.
-    Handles &, <, > (and quotes, harmless extra safety) so that any
-    dynamic string — symbol names, formatted numbers, log-derived
-    text — can never break XML parsing.
-    """
+    """Escapes text for safe embedding inside SVG/XML text content."""
     return _saxutils.escape(str(s))
 
 def flag_failed(sym: str, reason: str):
-
     with _FAILED_LOCK:
         FAILED_SYMBOLS.add(sym)
 
@@ -371,7 +334,6 @@ def flag_failed(sym: str, reason: str):
 
 
 def is_failed(sym: str) -> bool:
-
     with _FAILED_LOCK:
         return sym in FAILED_SYMBOLS
 
@@ -402,11 +364,6 @@ specs: Dict[str, Dict] = {}
 
 
 # ── contribution-weighting calculation logic ──────────────────────────────────
-#
-# Ported from the standalone correlation/allocation-weight analysis
-# script. Operates over MEXC's daily-kline endpoint (independent of
-# the 1-minute buffers used by the trigger engine) and is only ever
-# invoked once per UTC calendar day — see recompute_contributions_if_due.
 
 def fetch_30d_daily_closes(symbol: str) -> Dict[int, float]:
     """Fetches trailing N-day daily kline data from MEXC API."""
@@ -476,24 +433,6 @@ def calculate_pearson_correlation(x: List[float], y: List[float]) -> float:
 
 
 def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float]]:
-    """
-    Runs the full correlation -> z-score -> normalized-weight ->
-    per-trigger-USD pipeline over `symbols`.
-
-    Returns a dict mapping every symbol in `symbols` to its
-    per-trigger USD contribution, or None if the fetch failed
-    outright for every symbol (total outage), signalling that the
-    caller should fall back to flat BASE_TRIGGER_USD for all symbols
-    rather than trade on a degenerate all-zero computation.
-
-    A partial outage (some symbols fetch, some don't) still returns
-    a full dict — symbols with no data simply contribute all-zero
-    return series, which calculate_volatility/calculate_pearson_
-    correlation already handle gracefully (0.0 volatility, 0.0
-    correlation to everything), naturally pulling them toward a
-    smaller-but-nonzero share rather than crashing the computation.
-    """
-
     returns_data: Dict[str, List[float]] = {}
     vol_data: Dict[str, Dict[str, float]] = {}
 
@@ -501,6 +440,7 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
 
     for sym in symbols:
         closes = fetch_30d_daily_closes(sym)
+        n_candles = len(closes)
         log.info(
             f"[{sym}] contribution-weighting fetch: "
             f"{n_candles} daily candles received "
@@ -508,7 +448,6 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
         )
 
         if n_candles < CONTRIB_LOOKBACK_DAYS:
-
             log.warning(
                 f"[{sym}] fetched {n_candles} candles, short of the "
                 f"requested {CONTRIB_LOOKBACK_DAYS}d — MEXC may not "
@@ -523,17 +462,14 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
         vol_data[sym] = {"daily": d_vol, "annualized": a_vol}
 
     if not any_fetch_succeeded:
-
         log.error(
             "contribution-weighting recompute: ALL daily-close "
             "fetches failed — total outage, caller will fall back "
             "to flat BASE_TRIGGER_USD for every symbol"
         )
-
         return None
 
     num_assets = len(symbols)
-
     corr_matrix: Dict[str, Dict[str, float]] = {s1: {} for s1 in symbols}
 
     for i, sym1 in enumerate(symbols):
@@ -577,6 +513,8 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
     )
 
     return contrib_per_trigger_usd
+
+
 # ── shared state ──────────────────────────────────────────────────────────────
 
 class SharedState:
@@ -629,42 +567,6 @@ STATE = SharedState()
 
 
 # ── persisted state ──────────────────────────────────────────────────────────
-#
-# {
-#   "orders": [...],
-#   "triggers": [
-#       {"symbol": "...", "candle_time": "...", "price": ..., "window": "2d"},
-#       ...
-#   ],
-#   "budget": {"USOIL_USDT": 3.50, ...},
-#   "accumulator": {"USOIL_USDT": 0.0, ...},
-#   "last_accrual_date": {"USOIL_USDT": "2026-08-20", ...},
-#   "last_seen_minute": {"USOIL_USDT": "2026-08-20T14:07:00+00:00", ...},
-#   "daily_stats": {
-#       "USOIL_USDT": {
-#           "window_start": "2026-08-20T14:00:03+00:00",
-#           "triggers": 0,
-#           "order_value_usd": 0.0,
-#           "orders_ok": 0,
-#           "orders_failed": 0,
-#           "attempt_price_sum": 0.0,
-#           "attempt_count": 0
-#       },
-#       ...
-#   },
-#   "last_report_sent_at": "2026-08-19T14:00:07+00:00",
-#   "contrib_per_trigger_usd": {"USOIL_USDT": 1.073, ...},
-#   "contrib_last_computed_date": "2026-08-20"
-# }
-#
-# "triggers" is a lightweight rolling log (trimmed to the chart
-# window) used purely to render trigger markers on charts —
-# separate from "orders", which only ever contains real fills.
-#
-# "contrib_per_trigger_usd" is the cached, daily-recomputed output
-# of compute_contribution_weights — see CONTRIBUTION WEIGHTING in
-# the module docstring. "contrib_last_computed_date" guards against
-# recomputing more than once per UTC calendar day.
 
 def _default_daily_stats(now_iso: str) -> Dict:
     return {
@@ -694,9 +596,7 @@ def _default_state() -> Dict:
 
 
 def load_state() -> Dict:
-
     try:
-
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
 
@@ -704,51 +604,29 @@ def load_state() -> Dict:
             raise ValueError("state file did not contain a dict")
 
         defaults = _default_state()
-
         for k, v in defaults.items():
             data.setdefault(k, v)
 
         return data
 
     except FileNotFoundError:
-
-        log.info(
-            f"no state file at {STATE_FILE} — starting fresh"
-        )
-
+        log.info(f"no state file at {STATE_FILE} — starting fresh")
         return _default_state()
 
     except Exception as e:
-
-        log.error(
-            f"state file at {STATE_FILE} unreadable ({e}) "
-            f"— starting fresh"
-        )
-
+        log.error(f"state file at {STATE_FILE} unreadable ({e}) — starting fresh")
         return _default_state()
 
 
 def save_state(state: Dict):
-
     try:
-
-        os.makedirs(
-            os.path.dirname(STATE_FILE) or ".",
-            exist_ok=True
-        )
-
+        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
         tmp = STATE_FILE + ".tmp"
-
         with open(tmp, "w") as f:
             json.dump(state, f)
-
         os.replace(tmp, STATE_FILE)
-
     except Exception as e:
-
-        log.error(
-            f"failed to persist state to {STATE_FILE}: {e}"
-        )
+        log.error(f"failed to persist state to {STATE_FILE}: {e}")
 
 
 STATE_DATA: Dict = load_state()
@@ -756,26 +634,17 @@ _STATE_DATA_LOCK = threading.Lock()
 
 
 def get_budget(sym: str) -> float:
-
-    return float(
-        STATE_DATA["budget"].get(sym, 0.0)
-    )
+    return float(STATE_DATA["budget"].get(sym, 0.0))
 
 
 def get_accumulator(sym: str) -> float:
-
-    return float(
-        STATE_DATA["accumulator"].get(sym, 0.0)
-    )
+    return float(STATE_DATA["accumulator"].get(sym, 0.0))
 
 
 def get_last_accrual_date(sym: str) -> Optional[datetime.date]:
-
     s = STATE_DATA["last_accrual_date"].get(sym)
-
     if not s:
         return None
-
     try:
         return datetime.date.fromisoformat(s)
     except Exception:
@@ -783,12 +652,9 @@ def get_last_accrual_date(sym: str) -> Optional[datetime.date]:
 
 
 def get_last_seen_minute(sym: str) -> Optional[datetime.datetime]:
-
     s = STATE_DATA["last_seen_minute"].get(sym)
-
     if not s:
         return None
-
     try:
         return datetime.datetime.fromisoformat(s)
     except Exception:
@@ -796,29 +662,18 @@ def get_last_seen_minute(sym: str) -> Optional[datetime.datetime]:
 
 
 def _persist():
-
     save_state(STATE_DATA)
 
 
 def accrue_daily_budget_if_due(sym: str, today: datetime.date):
-
-    """
-    NON-FAILED symbols only — callers must check is_failed() first.
-    """
-
     with _STATE_DATA_LOCK:
-
         last = get_last_accrual_date(sym)
-
         if last == today:
             return
 
         prev_budget = get_budget(sym)
-
         new_budget = prev_budget + BUDGET_DAILY_ACCRUAL_USD
-
         STATE_DATA["budget"][sym] = new_budget
-
         STATE_DATA["last_accrual_date"][sym] = today.isoformat()
 
         _persist()
@@ -833,30 +688,15 @@ def accrue_daily_budget_if_due(sym: str, today: datetime.date):
 # ── contribution-weighting cache accessors ────────────────────────────────────
 
 def get_contrib_per_trigger_usd(sym: str) -> float:
-
-    """
-    Returns the cached, daily-recomputed per-trigger USD
-    contribution for sym. Falls back to flat BASE_TRIGGER_USD if
-    the symbol is absent from the cache — e.g. before the very
-    first recompute has ever completed, or if a total-outage
-    fallback is currently in effect (see recompute_contributions_
-    if_due, which writes BASE_TRIGGER_USD for every symbol in that
-    case, so this branch is a belt-and-suspenders default rather
-    than the primary fallback path).
-    """
-
     return float(
         STATE_DATA["contrib_per_trigger_usd"].get(sym, TRIGGER_STACK_USD)
     )
 
 
 def get_contrib_last_computed_date() -> Optional[datetime.date]:
-
     s = STATE_DATA.get("contrib_last_computed_date")
-
     if not s:
         return None
-
     try:
         return datetime.date.fromisoformat(s)
     except Exception:
@@ -864,49 +704,21 @@ def get_contrib_last_computed_date() -> Optional[datetime.date]:
 
 
 def set_contrib_per_trigger_usd(values: Dict[str, float], today: datetime.date):
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["contrib_per_trigger_usd"] = dict(values)
-
         STATE_DATA["contrib_last_computed_date"] = today.isoformat()
-
         _persist()
 
 
-def recompute_contributions_if_due(today: datetime.date):
-
-    """
-    Once-per-UTC-calendar-day recompute of per-symbol per-trigger
-    USD contributions, mirroring the due-check pattern used by
-    accrue_daily_budget_if_due (per-day guard). Unlike the budget
-    accrual, this is ONE computation covering ALL symbols at once
-    (the correlation matrix is inherently cross-symbol), so it is
-    guarded by a single shared date rather than a per-symbol date.
-
-    Called once per engine_cycle(), BEFORE run_minute_checks(), so
-    that a value is always available before any trigger this cycle
-    can call add_trigger_dollar(). On the very first-ever run (no
-    cached date), this makes recompute happen synchronously before
-    trading starts.
-
-    On total fetch failure (compute_contribution_weights returns
-    None), every symbol in SYMBOLS is written as flat
-    BASE_TRIGGER_USD for today, and the date guard is still
-    advanced to today — this is a deliberate flat-fallback, not a
-    retry-every-cycle: the next recompute attempt is the following
-    UTC day, consistent with "recompute once daily, cached between
-    recalculations."
-    """
-
+def recompute_contributions_if_due(today: datetime.date, force: bool = False):
     last = get_contrib_last_computed_date()
 
-    if last == today:
+    if not force and last == today:
         return
 
     log.info(
         f"contribution-weighting recompute due "
-        f"(last={last}, today={today}) — running "
+        f"(last={last}, today={today}, force={force}) — running "
         f"{CONTRIB_LOOKBACK_DAYS}-day analysis over "
         f"{len(SYMBOLS)} symbols"
     )
@@ -914,56 +726,38 @@ def recompute_contributions_if_due(today: datetime.date):
     result = compute_contribution_weights(SYMBOLS)
 
     if result is None:
-
         log.error(
             "contribution-weighting recompute FAILED (total outage) "
             f"— falling back to flat ${BASE_TRIGGER_USD:.2f} for "
             "every symbol today"
         )
-
         result = {sym: BASE_TRIGGER_USD for sym in SYMBOLS}
 
     set_contrib_per_trigger_usd(result, today)
 
 
 def add_trigger_dollar(sym: str) -> float:
-
     with _STATE_DATA_LOCK:
-
         prev = get_accumulator(sym)
-
         contribution = get_contrib_per_trigger_usd(sym)
-
         new = prev + contribution
-
         STATE_DATA["accumulator"][sym] = new
-
         _persist()
-
         return new
 
 
 def reset_accumulator(sym: str):
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["accumulator"][sym] = 0.0
-
         _persist()
 
 
 def spend_budget(sym: str, usd: float):
-
     with _STATE_DATA_LOCK:
-
         prev = get_budget(sym)
-
         new = prev - usd
-
         STATE_DATA["budget"][sym] = new
-
         _persist()
-
         log.info(
             f"[{sym}] budget spent ${usd:.2f}: "
             f"{prev:.2f} -> {new:.2f}"
@@ -971,20 +765,14 @@ def spend_budget(sym: str, usd: float):
 
 
 def set_last_seen_minute(sym: str, minute_dt: datetime.datetime):
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["last_seen_minute"][sym] = minute_dt.isoformat()
-
         _persist()
 
 
 def record_order(order_record: Dict):
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["orders"].append(order_record)
-
         _persist()
 
 
@@ -994,15 +782,7 @@ def record_trigger_marker(
     price: float,
     window_label: str
 ):
-
-    """
-    Lightweight log entry used purely for chart trigger markers.
-    Recorded for EVERY symbol on every trigger, failed or not.
-    Trimmed to roughly the chart window on write to bound growth.
-    """
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["triggers"].append({
             "symbol": sym,
             "candle_time": candle_dt.isoformat(),
@@ -1022,10 +802,8 @@ def record_trigger_marker(
 
 
 def _safe_ts(iso_str: Optional[str]) -> Optional[float]:
-
     if not iso_str:
         return None
-
     try:
         return datetime.datetime.fromisoformat(iso_str).timestamp()
     except Exception:
@@ -1033,39 +811,23 @@ def _safe_ts(iso_str: Optional[str]) -> Optional[float]:
 
 
 def total_orders_count() -> int:
-
     return len(STATE_DATA["orders"])
 
 
 # ── daily stats (activity report counters) ────────────────────────────────────
 
 def _ensure_daily_stats_initialized(sym: str):
-
-    """
-    Ensures a daily_stats entry exists for sym. Does NOT reset based
-    on calendar date anymore — resets only happen explicitly after
-    a successful report send (see reset_daily_stats_all below).
-    """
-
     with _STATE_DATA_LOCK:
-
         if sym not in STATE_DATA["daily_stats"]:
-
             now_iso = datetime.datetime.now(UTC).isoformat()
-
             STATE_DATA["daily_stats"][sym] = _default_daily_stats(now_iso)
-
             _persist()
 
 
 def record_trigger_stat(sym: str):
-
     _ensure_daily_stats_initialized(sym)
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["daily_stats"][sym]["triggers"] += 1
-
         _persist()
 
 
@@ -1075,18 +837,9 @@ def record_attempt_stat(
     success: bool,
     usd_if_success: float = 0.0
 ):
-
-    """
-    NON-FAILED symbols only — failed symbols never attempt orders,
-    so this is never called for them.
-    """
-
     _ensure_daily_stats_initialized(sym)
-
     with _STATE_DATA_LOCK:
-
         stats = STATE_DATA["daily_stats"][sym]
-
         stats["attempt_price_sum"] += price
         stats["attempt_count"] += 1
 
@@ -1100,42 +853,25 @@ def record_attempt_stat(
 
 
 def get_daily_stats_snapshot(sym: str) -> Dict:
-
     _ensure_daily_stats_initialized(sym)
-
     with _STATE_DATA_LOCK:
-
         return dict(STATE_DATA["daily_stats"].get(
             sym, _default_daily_stats(datetime.datetime.now(UTC).isoformat())
         ))
 
 
 def reset_daily_stats_all(now_utc: datetime.datetime):
-
-    """
-    Called ONLY immediately after a successful report send. Resets
-    every symbol's counters and sets window_start to now, so the
-    next report covers exactly "since this reset."
-    """
-
     now_iso = now_utc.isoformat()
-
     with _STATE_DATA_LOCK:
-
         for sym in SYMBOLS:
-
             STATE_DATA["daily_stats"][sym] = _default_daily_stats(now_iso)
-
         _persist()
 
 
 def get_last_report_sent_at() -> Optional[datetime.datetime]:
-
     s = STATE_DATA.get("last_report_sent_at")
-
     if not s:
         return None
-
     try:
         return datetime.datetime.fromisoformat(s)
     except Exception:
@@ -1143,11 +879,8 @@ def get_last_report_sent_at() -> Optional[datetime.datetime]:
 
 
 def set_last_report_sent_at(dt: datetime.datetime):
-
     with _STATE_DATA_LOCK:
-
         STATE_DATA["last_report_sent_at"] = dt.isoformat()
-
         _persist()
 
 
@@ -1160,12 +893,8 @@ def _http(
     data=None,
     params=None
 ):
-
     if params:
-
-        url += "?" + urllib.parse.urlencode(
-            sorted(params.items())
-        )
+        url += "?" + urllib.parse.urlencode(sorted(params.items()))
 
     req = urllib.request.Request(
         url,
@@ -1175,32 +904,16 @@ def _http(
     )
 
     try:
-
-        with urllib.request.urlopen(
-            req,
-            timeout=10
-        ) as r:
-
+        with urllib.request.urlopen(req, timeout=10) as r:
             body = r.read()
-
     except urllib.error.HTTPError as e:
-
         body = e.read()
 
-    return (
-        json.loads(body)
-        if body.strip()
-        else {}
-    )
+    return json.loads(body) if body.strip() else {}
 
 
 def _get(url):
-
-    with urllib.request.urlopen(
-        url,
-        timeout=10
-    ) as r:
-
+    with urllib.request.urlopen(url, timeout=10) as r:
         return json.loads(r.read())
 
 
@@ -1212,25 +925,14 @@ def mexc(
     params=None,
     body=None
 ):
-
     params = params or {}
-
-    ts = str(
-        int(time.time() * 1000)
-    )
+    ts = str(int(time.time() * 1000))
 
     sp = (
-        "&".join(
-            f"{k}={v}"
-            for k, v in sorted(params.items())
-        )
+        "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         if method == "GET"
         else (
-            json.dumps(
-                body,
-                separators=(",", ":"),
-                sort_keys=True
-            )
+            json.dumps(body, separators=(",", ":"), sort_keys=True)
             if body
             else ""
         )
@@ -1251,150 +953,78 @@ def mexc(
     }
 
     raw = (
-        json.dumps(
-            body,
-            separators=(",", ":"),
-            sort_keys=True
-        ).encode()
+        json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
         if body and method not in ("GET", "DELETE")
         else None
     )
 
     try:
-
         return _http(
             method,
             MEXC_BASE + endpoint,
             headers=hdr,
             data=raw,
-            params=params
-            if method in ("GET", "DELETE")
-            else None
+            params=params if method in ("GET", "DELETE") else None
         )
-
     except Exception as e:
-
-        log.error(
-            f"mexc {method} {endpoint}: {e}"
-        )
-
+        log.error(f"mexc {method} {endpoint}: {e}")
         return {}
 
 
 # ── ntfy ──────────────────────────────────────────────────────────────────────
 
 def ntfy_send(message: str, title: Optional[str] = None) -> bool:
-
-    """
-    Pushes a plain-text message to the configured ntfy.sh topic.
-    Returns True on apparent success, False on failure. Never
-    raises — a failed notification must not affect trading.
-    """
-
     headers = {"Content-Type": "text/plain; charset=utf-8"}
-
     if title:
         headers["Title"] = title
 
     try:
-
         req = urllib.request.Request(
             NTFY_URL,
             data=message.encode("utf-8"),
             headers=headers,
             method="POST"
         )
-
         with urllib.request.urlopen(req, timeout=10) as r:
-
             r.read()
 
         log.info(f"ntfy: report sent to {NTFY_URL}")
-
         return True
-
     except Exception as e:
-
         log.error(f"ntfy: failed to send report: {e}")
-
         return False
 
 
 # ── contract specifications ───────────────────────────────────────────────────
 
 def load_specs():
-
-    """
-    Fetch contract specifications once for every symbol.
-
-    A symbol whose specs cannot be loaded is flagged failed rather
-    than aborting the whole process, so other symbols can still
-    trade (and this symbol can still chart).
-    """
-
     rows = (
-        mexc(
-            "GET",
-            "/api/v1/contract/detail"
-        ).get("data") or []
+        mexc("GET", "/api/v1/contract/detail").get("data") or []
     )
 
     if not rows:
-
         log.error(
             "empty contract detail response from MEXC — "
             "flagging all symbols failed"
         )
-
         for sym in SYMBOLS:
-
-            flag_failed(
-                sym,
-                "empty contract detail response from MEXC"
-            )
-
+            flag_failed(sym, "empty contract detail response from MEXC")
         return
 
-    by_sym = {
-        c.get("symbol", "").upper(): c
-        for c in rows
-    }
+    by_sym = {c.get("symbol", "").upper(): c for c in rows}
 
     for sym in SYMBOLS:
-
         match = by_sym.get(sym)
-
         if match is None:
-
-            flag_failed(
-                sym,
-                "symbol not found in MEXC contract detail"
-            )
-
+            flag_failed(sym, "symbol not found in MEXC contract detail")
             continue
 
-        vu = float(
-            match.get("volUnit", 1)
-        )
+        vu = float(match.get("volUnit", 1))
+        pu = float(match.get("priceUnit", 0.01))
+        cs = float(match.get("contractSize", vu))
 
-        pu = float(
-            match.get("priceUnit", 0.01)
-        )
-
-        cs = float(
-            match.get("contractSize", vu)
-        )
-
-        raw = (
-            f"{vu:.10f}"
-            .rstrip("0")
-        )
-
-        p = (
-            len(raw.split(".")[1])
-            if "." in raw
-            else 0
-        )
+        raw = f"{vu:.10f}".rstrip("0")
+        p = len(raw.split(".")[1]) if "." in raw else 0
 
         specs[sym] = {
             "p": p,
@@ -1403,101 +1033,47 @@ def load_specs():
             "cs": cs,
         }
 
-        log.info(
-            f"loaded specs for {sym}: "
-            f"{specs[sym]}"
-        )
+        log.info(f"loaded specs for {sym}: {specs[sym]}")
 
 
 def _tick(sym):
-
-    return specs.get(
-        sym,
-        {}
-    ).get("t", 0.01)
+    return specs.get(sym, {}).get("t", 0.01)
 
 
 def _prec(sym):
-
-    return specs.get(
-        sym,
-        {}
-    ).get("p", 0)
+    return specs.get(sym, {}).get("p", 0)
 
 
 def _rfmt_price(sym, v):
-
     t = _tick(sym)
-
     r = round(v / t) * t
-
-    s = (
-        f"{t:.10f}"
-        .rstrip("0")
-    )
-
-    dec = (
-        len(s.split(".")[1])
-        if "." in s
-        else 0
-    )
-
+    s = f"{t:.10f}".rstrip("0")
+    dec = len(s.split(".")[1]) if "." in s else 0
     return f"{r:.{dec}f}"
 
 
 def _rfmt_vol(sym, v):
-
     p = _prec(sym)
-
     if p >= 0:
-
-        return (
-            f"{round(v, p):.{p}f}"
-        )
-
+        return f"{round(v, p):.{p}f}"
     d = 10 ** abs(p)
-
-    return str(
-        int(round(v / d) * d)
-    )
+    return str(int(round(v / d) * d))
 
 
-def _contracts(
-    sym,
-    usd,
-    price
-):
-
-    cs = specs.get(
-        sym,
-        {}
-    ).get("cs", 1.0)
-
+def _contracts(sym, usd, price):
+    cs = specs.get(sym, {}).get("cs", 1.0)
     return float(
-        _rfmt_vol(
-            sym,
-            max(
-                0,
-                usd / (cs * price)
-            )
-        )
+        _rfmt_vol(sym, max(0, usd / (cs * price)))
     )
 
 
 def _mos(sym):
-
-    return specs.get(
-        sym,
-        {}
-    ).get("vu", 1.0)
+    return specs.get(sym, {}).get("vu", 1.0)
 
 
 # ── open orders ───────────────────────────────────────────────────────────────
 
-def _open_orders_for_sym(
-    sym: str
-) -> List[Dict]:
-
+def _open_orders_for_sym(sym: str) -> List[Dict]:
     data = (
         mexc(
             "GET",
@@ -1511,27 +1087,13 @@ def _open_orders_for_sym(
     )
 
     if isinstance(data, dict):
+        data = data.get("resultList", [])
 
-        data = data.get(
-            "resultList",
-            []
-        )
-
-    return [
-        o for o in data
-        if o.get(
-            "symbol",
-            ""
-        ).upper() == sym
-    ]
+    return [o for o in data if o.get("symbol", "").upper() == sym]
 
 
 def _open_ids(sym: str) -> set:
-
-    return {
-        str(o.get("orderId", ""))
-        for o in _open_orders_for_sym(sym)
-    }
+    return {str(o.get("orderId", "")) for o in _open_orders_for_sym(sym)}
 
 
 # ── order placement ──────────────────────────────────────────────────────────
@@ -1542,42 +1104,22 @@ def place_long(
     sizing_price: float,
     usd_amount: float
 ) -> Optional[str]:
-
-    vol = _contracts(
-        sym,
-        usd_amount,
-        sizing_price
-    )
+    vol = _contracts(sym, usd_amount, sizing_price)
 
     if vol < _mos(sym):
-
         log.warning(
             f"[{sym}] size {vol} < min "
             f"{_mos(sym)} (${usd_amount:.2f}) "
             "— order skipped"
         )
-
         return "SKIP"
 
-    return _place_long_contracts(
-        sym,
-        limit_price,
-        vol
-    )
+    return _place_long_contracts(sym, limit_price, vol)
 
 
-def place_long_min_size(
-    sym: str,
-    limit_price: float
-) -> Optional[str]:
-
+def place_long_min_size(sym: str, limit_price: float) -> Optional[str]:
     vol = _mos(sym)
-
-    return _place_long_contracts(
-        sym,
-        limit_price,
-        vol
-    )
+    return _place_long_contracts(sym, limit_price, vol)
 
 
 def _place_long_contracts(
@@ -1585,58 +1127,33 @@ def _place_long_contracts(
     limit_price: float,
     vol: float
 ) -> Optional[str]:
-
     body = {
         "leverage": LEVERAGE,
         "openType": 2,
         "positionMode": 1,
-        "price": _rfmt_price(
-            sym,
-            limit_price
-        ),
+        "price": _rfmt_price(sym, limit_price),
         "side": 1,
         "symbol": sym,
         "type": 1,
-        "vol": _rfmt_vol(
-            sym,
-            vol
-        ),
+        "vol": _rfmt_vol(sym, vol),
     }
 
-    r = mexc(
-        "POST",
-        "/api/v1/private/order/create",
-        body=body
-    )
+    r = mexc("POST", "/api/v1/private/order/create", body=body)
 
     if not r.get("success"):
-
-        log.error(
-            f"[{sym}] long order rejected: {r}"
-        )
-
+        log.error(f"[{sym}] long order rejected: {r}")
         return None
 
     data = r.get("data") or {}
 
     if not isinstance(data, dict):
-
-        log.error(
-            f"[{sym}] unexpected 'data' shape "
-            f"from order/create: {data!r}"
-        )
-
+        log.error(f"[{sym}] unexpected 'data' shape from order/create: {data!r}")
         return None
 
     oid = data.get("orderId")
 
     if not oid:
-
-        log.error(
-            f"[{sym}] order/create succeeded "
-            f"but no 'orderId' in data: {data!r}"
-        )
-
+        log.error(f"[{sym}] order/create succeeded but no 'orderId' in data: {data!r}")
         return None
 
     oid = str(oid)
@@ -1653,54 +1170,26 @@ def _place_long_contracts(
 
 # ── cancel order ──────────────────────────────────────────────────────────────
 
-def cancel_order(
-    sym: str,
-    oid: str
-) -> bool:
-
+def cancel_order(sym: str, oid: str) -> bool:
     body = [oid]
-
-    r = mexc(
-        "POST",
-        "/api/v1/private/order/cancel",
-        body=body
-    )
-
-    ok = bool(
-        r.get("success")
-    )
+    r = mexc("POST", "/api/v1/private/order/cancel", body=body)
+    ok = bool(r.get("success"))
 
     if ok:
-
-        log.info(
-            f"[{sym}] cancelled order "
-            f"id={oid}"
-        )
-
+        log.info(f"[{sym}] cancelled order id={oid}")
     else:
-
-        log.error(
-            f"[{sym}] cancel failed "
-            f"for id={oid}: {r}"
-        )
+        log.error(f"[{sym}] cancel failed for id={oid}: {r}")
 
     return ok
 
 
-def is_filled(
-    sym: str,
-    oid: str
-) -> bool:
-
+def is_filled(sym: str, oid: str) -> bool:
     return oid not in _open_ids(sym)
 
 
 # ── mark price ────────────────────────────────────────────────────────────────
 
-def get_mark(
-    sym: str
-) -> float:
-
+def get_mark(sym: str) -> float:
     d = (
         mexc(
             "GET",
@@ -1710,10 +1199,7 @@ def get_mark(
     )
 
     return float(
-        d.get(
-            "fairPrice",
-            d.get("lastPrice", 0)
-        ) or 0
+        d.get("fairPrice", d.get("lastPrice", 0)) or 0
     )
 
 
@@ -1724,7 +1210,6 @@ def fetch_minute_bars(
     start_s: int,
     end_s: int
 ) -> List[Dict]:
-
     now_s = int(time.time())
 
     url = (
@@ -1735,24 +1220,13 @@ def fetch_minute_bars(
     )
 
     try:
-
         raw = _get(url)
-
     except Exception as e:
-
-        log.error(
-            f"[{sym}] minute kline fetch failed: {e}"
-        )
-
+        log.error(f"[{sym}] minute kline fetch failed: {e}")
         return []
 
     if not raw.get("success"):
-
-        log.error(
-            f"[{sym}] minute kline fetch "
-            f"unsuccessful: {raw}"
-        )
-
+        log.error(f"[{sym}] minute kline fetch unsuccessful: {raw}")
         return []
 
     d = raw.get("data") or {}
@@ -1763,14 +1237,10 @@ def fetch_minute_bars(
     lows   = d.get("realLow")   or d.get("low")   or []
     closes = d.get("realClose") or d.get("close") or []
 
-    n = min(
-        len(times), len(opens), len(highs), len(lows), len(closes)
-    )
-
+    n = min(len(times), len(opens), len(highs), len(lows), len(closes))
     bars = []
 
     for i in range(n):
-
         t_s = int(times[i])
 
         if t_s + 60 > now_s:
@@ -1790,7 +1260,6 @@ def fetch_minute_bars(
         bars.append({"t": t_s, "o": o, "h": h, "l": l, "c": c})
 
     bars.sort(key=lambda b: b["t"])
-
     return bars
 
 
@@ -1803,65 +1272,45 @@ class MinuteBuffer:
         self.lock = threading.Lock()
 
     def seed(self, bars: List[Dict]):
-
         with self.lock:
             self.bars = collections.deque(bars)
             self._trim_locked()
 
     def append_new(self, bars: List[Dict]):
-
         with self.lock:
-
-            existing_ts = {
-                b["t"] for b in self.bars
-            }
+            existing_ts = {b["t"] for b in self.bars}
 
             for b in bars:
-
                 if b["t"] not in existing_ts:
-
                     self.bars.append(b)
                     existing_ts.add(b["t"])
 
             self._sort_and_trim_locked()
 
     def _sort_and_trim_locked(self):
-
         self.bars = collections.deque(
             sorted(self.bars, key=lambda b: b["t"])
         )
-
         self._trim_locked()
 
     def _trim_locked(self):
-
         cutoff = int(time.time()) - BUFFER_MAX_MINUTES * 60
-
         while self.bars and self.bars[0]["t"] < cutoff:
             self.bars.popleft()
 
     def latest_closed(self) -> Optional[Dict]:
-
         with self.lock:
-
             if not self.bars:
                 return None
-
             return self.bars[-1]
 
     def rolling_low(self, window_minutes: int) -> Optional[float]:
-
         with self.lock:
-
             if not self.bars:
                 return None
 
             cutoff = int(time.time()) - window_minutes * 60
-
-            window = [
-                b["l"] for b in self.bars
-                if b["t"] >= cutoff
-            ]
+            window = [b["l"] for b in self.bars if b["t"] >= cutoff]
 
             if not window:
                 return None
@@ -1869,12 +1318,10 @@ class MinuteBuffer:
             return min(window)
 
     def snapshot(self) -> List[Dict]:
-
         with self.lock:
             return list(self.bars)
 
     def size(self) -> int:
-
         with self.lock:
             return len(self.bars)
 
@@ -1884,64 +1331,32 @@ MINUTE_BUFFERS: Dict[str, MinuteBuffer] = {
 }
 
 
-# ── seeding constants ──────────────────────────────────────────────────────────
-
-# MEXC's kline endpoint appears to cap results per request (observed
-# ~2000 candles regardless of requested start/end span). Seeding
-# therefore pages backward through time in chunks rather than
-# requesting the whole window in one call.
-SEED_CHUNK_MINUTES = 1500   # comfortably under the observed ~2000 cap
-SEED_MAX_CHUNKS = (BUFFER_MAX_MINUTES // SEED_CHUNK_MINUTES) + 3  # safety margin
+SEED_CHUNK_MINUTES = 1500
+SEED_MAX_CHUNKS = (BUFFER_MAX_MINUTES // SEED_CHUNK_MINUTES) + 3
 
 
 def seed_minute_buffer(sym: str):
-
-    """
-    One-time startup seed of ~10 days of 1-minute history for sym.
-
-    A single fetch_minute_bars call for the full BUFFER_MAX_MINUTES
-    window is NOT sufficient — MEXC's kline endpoint appears to cap
-    the number of candles returned per request (observed ~2000)
-    regardless of the requested start/end span, silently truncating
-    rather than erroring. So this pages backward through time in
-    SEED_CHUNK_MINUTES-sized windows, oldest chunk last, merging
-    each into the buffer, until either the full BUFFER_MAX_MINUTES
-    window is covered or a chunk comes back empty (meaning history
-    doesn't go back further, e.g. a newly listed contract).
-
-    Called for EVERY symbol regardless of failed status, so failed
-    symbols still get full-history charts.
-    """
-
     now_s = int(time.time())
-
     window_start_s = now_s - BUFFER_MAX_MINUTES * 60
-
     all_bars: Dict[int, Dict] = {}
-
     chunk_end_s = now_s
-
     chunks_fetched = 0
 
     while chunk_end_s > window_start_s and chunks_fetched < SEED_MAX_CHUNKS:
-
         chunk_start_s = max(
             window_start_s,
             chunk_end_s - SEED_CHUNK_MINUTES * 60
         )
 
         bars = fetch_minute_bars(sym, chunk_start_s, chunk_end_s)
-
         chunks_fetched += 1
 
         if not bars:
-
             log.info(
                 f"[{sym}] seed chunk "
                 f"[{chunk_start_s}, {chunk_end_s}) returned no bars "
                 "— stopping (likely reached start of available history)"
             )
-
             break
 
         for b in bars:
@@ -1954,20 +1369,13 @@ def seed_minute_buffer(sym: str):
             f"{len(all_bars)} total so far"
         )
 
-        # Move the window back. Use the earliest bar actually
-        # returned (not just chunk_start_s) in case MEXC's response
-        # doesn't start exactly at the requested boundary.
         earliest_returned = min(b["t"] for b in bars)
-
         chunk_end_s = earliest_returned
 
-        # Small guard against an unresponsive/no-progress loop if
-        # the API returns the same earliest bar repeatedly.
         if chunk_end_s >= chunk_start_s + SEED_CHUNK_MINUTES * 60:
             break
 
     sorted_bars = [all_bars[t] for t in sorted(all_bars.keys())]
-
     MINUTE_BUFFERS[sym].seed(sorted_bars)
 
     span_days = (
@@ -1985,7 +1393,6 @@ def seed_minute_buffer(sym: str):
     )
 
     if span_days < (BUFFER_MAX_MINUTES / 1440.0) * 0.9:
-
         log.warning(
             f"[{sym}] seeded buffer spans only ~{span_days:.1f} days, "
             f"short of the ~{BUFFER_MAX_MINUTES / 1440:.1f}-day target — "
@@ -1994,19 +1401,11 @@ def seed_minute_buffer(sym: str):
             "over the next few days of minute-by-minute updates"
         )
 
+
 def refresh_minute_buffer(sym: str):
-
-    """
-    Per-minute incremental update. Called for EVERY symbol
-    regardless of failed status.
-    """
-
     now_s = int(time.time())
-
     start_s = now_s - 5 * 60
-
     bars = fetch_minute_bars(sym, start_s, now_s)
-
     if bars:
         MINUTE_BUFFERS[sym].append_new(bars)
 
@@ -2014,26 +1413,19 @@ def refresh_minute_buffer(sym: str):
 # ── resampling for charts ─────────────────────────────────────────────────────
 
 def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
-
     if not bars:
         return []
 
     bucket_s = bucket_minutes * 60
-
     buckets: Dict[int, List[Dict]] = {}
 
     for b in bars:
-
         bucket_start = (b["t"] // bucket_s) * bucket_s
-
         buckets.setdefault(bucket_start, []).append(b)
 
     out = []
-
     for bucket_start in sorted(buckets.keys()):
-
         group = sorted(buckets[bucket_start], key=lambda b: b["t"])
-
         out.append({
             "t": bucket_start,
             "o": group[0]["o"],
@@ -2044,41 +1436,22 @@ def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
 
     return out
 
+
 # ── minute-trigger engine ─────────────────────────────────────────────────────
 
 def evaluate_trigger(sym: str, now_utc: datetime.datetime):
-
-    """
-    Runs for EVERY symbol, failed or not:
-      1. Refresh the buffer.
-      2. Look at the latest closed candle (skip if already seen).
-      3. Determine reference window off current budget.
-      4. Determine whether it's a trigger.
-
-    Returns (candle_dt, candle_low, ref_label, triggered) or None if
-    there's nothing new to evaluate this minute.
-
-    Does NOT touch budget, accumulator, or orders — callers decide
-    what to do with a trigger based on failed status.
-    """
-
     refresh_minute_buffer(sym)
-
     buf = MINUTE_BUFFERS[sym]
-
     latest = buf.latest_closed()
 
     if latest is None:
-
         log.warning(
             f"[{sym}] no closed 1-minute candle available yet "
             "— skipping this minute"
         )
-
         return None
 
     candle_dt = datetime.datetime.fromtimestamp(latest["t"], tz=UTC)
-
     last_seen = get_last_seen_minute(sym)
 
     if last_seen is not None and candle_dt <= last_seen:
@@ -2087,7 +1460,6 @@ def evaluate_trigger(sym: str, now_utc: datetime.datetime):
     set_last_seen_minute(sym, candle_dt)
 
     candle_low = latest["l"]
-
     budget = get_budget(sym)
 
     if budget >= 0:
@@ -2100,12 +1472,10 @@ def evaluate_trigger(sym: str, now_utc: datetime.datetime):
     ref_low = buf.rolling_low(ref_window)
 
     if ref_low is None:
-
         log.warning(
             f"[{sym}] insufficient buffer data to compute "
             f"{ref_label} low — skipping this minute"
         )
-
         return None
 
     triggered = candle_low <= ref_low
@@ -2123,27 +1493,10 @@ def evaluate_trigger(sym: str, now_utc: datetime.datetime):
 
 
 def process_symbol_minute(sym: str, now_utc: datetime.datetime):
-
-    """
-    Top-level per-symbol per-minute entry point. Runs for every
-    symbol, failed or not.
-
-    FAILED symbols: evaluate trigger only, record a marker for
-    charting if triggered, and stop — never touch budget/
-    accumulator/orders.
-
-    NON-FAILED symbols: full trading path — accrue budget, evaluate
-    trigger, stack accumulator (at that symbol's CURRENT cached
-    per-trigger USD contribution — see add_trigger_dollar), attempt
-    order if threshold reached.
-    """
-
     failed = is_failed(sym)
 
     if not failed:
-
         today = now_utc.date()
-
         accrue_daily_budget_if_due(sym, today)
 
     result = evaluate_trigger(sym, now_utc)
@@ -2156,18 +1509,14 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     if not triggered:
         return
 
-    # Every trigger, failed or not, gets logged for chart markers
-    # and counted in the daily stats trigger count.
     record_trigger_marker(sym, candle_dt, candle_low, ref_label)
     record_trigger_stat(sym)
 
     if failed:
-
         log.info(
             f"[{sym}] TRIGGER (failed symbol, marker-only, "
             f"no accumulation) @ price={candle_low:.4f}"
         )
-
         return
 
     pending = add_trigger_dollar(sym)
@@ -2181,13 +1530,11 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     vol_at_price = _contracts(sym, pending, candle_low)
 
     if vol_at_price < _mos(sym):
-
         log.info(
             f"[{sym}] accumulator ${pending:.2f} still below "
             f"min order size ({_mos(sym)} contracts @ "
             f"{candle_low:.4f}) — stacking, no order placed"
         )
-
         return
 
     log.info(
@@ -2203,30 +1550,22 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     )
 
     if oid == "SKIP" or oid is None:
-
         record_attempt_stat(sym, candle_low, success=False)
-
         if oid == "SKIP":
-
             log.warning(
                 f"[{sym}] fire skipped by place_long despite "
                 "passing pre-check — leaving accumulator intact"
             )
-
         else:
-
             log.error(
                 f"[{sym}] minute-trigger order rejected by MEXC — "
                 "leaving accumulator intact, will retry on next "
                 "trigger"
             )
-
         return
 
     record_attempt_stat(sym, candle_low, success=True, usd_if_success=pending)
-
     reset_accumulator(sym)
-
     spend_budget(sym, pending)
 
     record_order({
@@ -2241,21 +1580,10 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
 
 
 def run_minute_checks(now_utc: datetime.datetime):
-
-    """
-    Runs for EVERY symbol, failed or not — failed symbols are
-    evaluated for trigger-marking/charting purposes but never
-    trade. See process_symbol_minute.
-    """
-
     for sym in SYMBOLS:
-
         try:
-
             process_symbol_minute(sym, now_utc)
-
         except Exception as e:
-
             log.error(
                 f"[{sym}] minute check failed: {e}",
                 exc_info=True
@@ -2265,40 +1593,29 @@ def run_minute_checks(now_utc: datetime.datetime):
 # ── daily activity report ─────────────────────────────────────────────────────
 
 def build_daily_report_text(now_utc: datetime.datetime) -> str:
-
     window_start = None
 
     for sym in SYMBOLS:
-
         stats = get_daily_stats_snapshot(sym)
-
         ws = _safe_ts(stats.get("window_start"))
-
         if ws is not None:
             window_start = ws
             break
 
     if window_start is not None:
-
-        window_start_dt = datetime.datetime.fromtimestamp(
-            window_start, tz=UTC
-        )
-
+        window_start_dt = datetime.datetime.fromtimestamp(window_start, tz=UTC)
         header = (
             f"Daily Activity Report — "
             f"{window_start_dt.strftime('%Y-%m-%d %H:%M')} UTC "
             f"to {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
         )
-
     else:
-
         header = (
             f"Daily Activity Report — as of "
             f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
         )
 
     contrib_date = get_contrib_last_computed_date()
-
     contrib_note = (
         f"Contribution weights last computed: {contrib_date.isoformat()}"
         if contrib_date is not None
@@ -2308,9 +1625,7 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
     lines = [header, contrib_note, ""]
 
     for sym in SYMBOLS:
-
         stats = get_daily_stats_snapshot(sym)
-
         triggers = stats["triggers"]
         order_value = stats["order_value_usd"]
         ok = stats["orders_ok"]
@@ -2329,7 +1644,6 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
         )
 
         excluded_note = " [EXCLUDED — not traded]" if is_failed(sym) else ""
-
         contrib = get_contrib_per_trigger_usd(sym)
 
         lines.append(
@@ -2345,15 +1659,6 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
 
 
 def maybe_send_daily_report(now_utc: datetime.datetime):
-
-    """
-    Sends the daily activity report at/after REPORT_HOUR_UTC:
-    REPORT_MINUTE_UTC, but only if at least REPORT_MIN_INTERVAL_HOURS
-    have passed since the last successful send. On success, resets
-    every symbol's daily counters so the next report's window starts
-    now.
-    """
-
     at_or_after_report_time = (
         (now_utc.hour, now_utc.minute)
         >= (REPORT_HOUR_UTC, REPORT_MINUTE_UTC)
@@ -2365,14 +1670,11 @@ def maybe_send_daily_report(now_utc: datetime.datetime):
     last_sent = get_last_report_sent_at()
 
     if last_sent is not None:
-
         hours_since = (now_utc - last_sent).total_seconds() / 3600.0
-
         if hours_since < REPORT_MIN_INTERVAL_HOURS:
             return
 
     report_text = build_daily_report_text(now_utc)
-
     log.info(f"sending daily activity report:\n{report_text}")
 
     sent_ok = ntfy_send(
@@ -2381,13 +1683,9 @@ def maybe_send_daily_report(now_utc: datetime.datetime):
     )
 
     if sent_ok:
-
         set_last_report_sent_at(now_utc)
-
         reset_daily_stats_all(now_utc)
-
     else:
-
         log.error(
             "daily report send failed — counters NOT reset, "
             "will retry next minute"
@@ -2397,22 +1695,16 @@ def maybe_send_daily_report(now_utc: datetime.datetime):
 # ── startup test orders ───────────────────────────────────────────────────────
 
 def _open_test_order(sym: str) -> Optional[Dict]:
-
     if sym not in specs:
-
         return None
 
     try:
-
         mark = get_mark(sym)
-
         if mark <= 0:
-
             flag_failed(
                 sym,
                 f"invalid mark price ({mark}) at startup test"
             )
-
             return None
 
         test_price = mark * TEST_ORDER_DISCOUNT
@@ -2426,23 +1718,13 @@ def _open_test_order(sym: str) -> Optional[Dict]:
             f"vol={min_vol} (exchange minimum)"
         )
 
-        oid = place_long_min_size(
-            sym,
-            test_price
-        )
+        oid = place_long_min_size(sym, test_price)
 
         if oid is None:
-
-            flag_failed(
-                sym,
-                "test order rejected by MEXC"
-            )
-
+            flag_failed(sym, "test order rejected by MEXC")
             return None
 
-        log.info(
-            f"[{sym}] test order placed id={oid}"
-        )
+        log.info(f"[{sym}] test order placed id={oid}")
 
         return {
             "sym": sym,
@@ -2452,37 +1734,22 @@ def _open_test_order(sym: str) -> Optional[Dict]:
         }
 
     except Exception as e:
-
-        flag_failed(
-            sym,
-            f"exception during test order open: {e}"
-        )
-
-        log.error(
-            f"[{sym}] test order open failed: {e}",
-            exc_info=True
-        )
-
+        flag_failed(sym, f"exception during test order open: {e}")
+        log.error(f"[{sym}] test order open failed: {e}", exc_info=True)
         return None
 
 
 def _close_test_order(pending: Dict):
-
     sym = pending["sym"]
     oid = pending["oid"]
 
     try:
-
         if is_filled(sym, oid):
-
             log.warning(
-                f"[{sym}] test order id={oid} "
-                f"FILLED during the "
+                f"[{sym}] test order id={oid} FILLED during the "
                 f"{TEST_ORDER_WAIT_SEC}s wait. "
-                "This is now a real open long "
-                "position. Symbol remains validated."
+                "This is now a real open long position. Symbol remains validated."
             )
-
             record_order({
                 "symbol": sym,
                 "timestamp": datetime.datetime.now(UTC).isoformat(),
@@ -2491,56 +1758,30 @@ def _close_test_order(pending: Dict):
                 "limit_price": pending["limit_price"],
                 "vol": pending["vol"],
             })
-
             return
 
-        cancelled = cancel_order(
-            sym,
-            oid
-        )
+        cancelled = cancel_order(sym, oid)
 
         if cancelled:
-
-            log.info(
-                f"[{sym}] test order id={oid} "
-                "cancelled successfully — symbol validated"
-            )
-
+            log.info(f"[{sym}] test order id={oid} cancelled successfully — symbol validated")
         else:
-
-            flag_failed(
-                sym,
-                f"test order id={oid} could not be cancelled"
-            )
+            flag_failed(sym, f"test order id={oid} could not be cancelled")
 
     except Exception as e:
-
-        flag_failed(
-            sym,
-            f"exception during test order close: {e}"
-        )
-
-        log.error(
-            f"[{sym}] test order close failed: {e}",
-            exc_info=True
-        )
+        flag_failed(sym, f"exception during test order close: {e}")
+        log.error(f"[{sym}] test order close failed: {e}", exc_info=True)
 
 
 def run_startup_test_orders():
-
     log.info(
         f"══ startup test orders: {len(SYMBOLS)} symbols — "
         f"phase 1/3: opening ══"
     )
 
     pending = []
-
     for sym in SYMBOLS:
-
         result = _open_test_order(sym)
-
         if result is not None:
-
             pending.append(result)
 
     log.info(
@@ -2550,12 +1791,9 @@ def run_startup_test_orders():
 
     time.sleep(TEST_ORDER_WAIT_SEC)
 
-    log.info(
-        "══ startup test orders: phase 3/3: closing ══"
-    )
+    log.info("══ startup test orders: phase 3/3: closing ══")
 
     for p in pending:
-
         _close_test_order(p)
 
     ok = [s for s in SYMBOLS if not is_failed(s)]
@@ -2571,14 +1809,11 @@ def run_startup_test_orders():
 # ── main overview SVG ─────────────────────────────────────────────────────────
 
 def render_svg(now_utc: datetime.datetime) -> str:
-
     W = 1200
     H = 60 + 30 * len(SYMBOLS)
 
     now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-
     contrib_date = get_contrib_last_computed_date()
-
     contrib_date_str = (
         contrib_date.isoformat() if contrib_date is not None else "pending"
     )
@@ -2590,18 +1825,14 @@ def render_svg(now_utc: datetime.datetime) -> str:
     )
 
     svg = [
-
         '<?xml version="1.0" encoding="UTF-8"?>',
-
         (
             f'<svg xmlns="http://www.w3.org/2000/svg" '
             f'viewBox="0 0 {W} {H}" '
             f'width="100%" '
             f'style="max-width:{W}px;display:block">'
         ),
-
         f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
-
         (
             f'<text x="20" y="24" '
             f'font-family="Courier New" '
@@ -2616,15 +1847,12 @@ def render_svg(now_utc: datetime.datetime) -> str:
     y = 50
 
     for sym in SYMBOLS:
-
         failed = is_failed(sym)
-
         budget = get_budget(sym)
         accum = get_accumulator(sym)
         contrib = get_contrib_per_trigger_usd(sym)
 
         buf = MINUTE_BUFFERS[sym]
-
         low2d = buf.rolling_low(ROLL_MINUTES_SHORT)
         low9d = buf.rolling_low(ROLL_MINUTES_LONG)
 
@@ -2639,20 +1867,15 @@ def render_svg(now_utc: datetime.datetime) -> str:
         )
 
         if failed:
-
             clr = "#cc0000"
-
             line = (
                 f"{sym:<16} "
                 "*** FAILED — EXCLUDED FROM TRADING "
                 "(chart & triggers still tracked) ***  "
                 f"2dLow={low2d_str:>12}  9dLow={low9d_str:>12}"
             )
-
         else:
-
             clr = "#1155cc" if budget >= 0 else "#cc7a00"
-
             line = (
                 f"{sym:<16} "
                 f"budget=${budget:>8,.2f}  "
@@ -2677,34 +1900,22 @@ def render_svg(now_utc: datetime.datetime) -> str:
         y += 30
 
     svg.append("</svg>")
-
     return "\n".join(svg)
 
 
 # ── per-symbol chart SVG ───────────────────────────────────────────────────────
 
 def render_symbol_chart_svg(sym: str) -> str:
-
-    """
-    Rendered for EVERY symbol, failed or not. Failed symbols get
-    the same candlesticks and threshold line, but only ever show
-    trigger tick-markers (never order circles, since none are ever
-    attempted).
-    """
-
     buf = MINUTE_BUFFERS[sym]
-
     bars_1m = buf.snapshot()
 
     now_s = int(time.time())
     cutoff = now_s - CHART_MINUTES * 60
 
     bars_1m = [b for b in bars_1m if b["t"] >= cutoff]
-
     candles = resample_ohlc(bars_1m, CHART_RESAMPLE_MIN)
 
     if not candles:
-
         return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             f'<svg xmlns="http://www.w3.org/2000/svg" '
@@ -2716,7 +1927,6 @@ def render_symbol_chart_svg(sym: str) -> str:
         )
 
     failed = is_failed(sym)
-
     budget = get_budget(sym)
     contrib = get_contrib_per_trigger_usd(sym)
 
@@ -2774,7 +1984,6 @@ def render_symbol_chart_svg(sym: str) -> str:
     ]
 
     for i in range(6):
-
         price = lo + span * i / 5
         y = y_of(price)
 
@@ -2791,7 +2000,6 @@ def render_symbol_chart_svg(sym: str) -> str:
         )
 
     if ref_low is not None:
-
         ry = y_of(ref_low)
 
         svg.append(
@@ -2811,7 +2019,6 @@ def render_symbol_chart_svg(sym: str) -> str:
     candle_px_w = max(1.5, plot_w / len(candles) * 0.7)
 
     for c in candles:
-
         x = x_of(c["t"]) + (plot_w / len(candles)) / 2
 
         up = c["c"] >= c["o"]
@@ -2819,7 +2026,6 @@ def render_symbol_chart_svg(sym: str) -> str:
 
         y_high = y_of(c["h"])
         y_low = y_of(c["l"])
-
         y_open = y_of(c["o"])
         y_close = y_of(c["c"])
 
@@ -2838,16 +2044,12 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'fill="{color}"/>'
         )
 
-    # Trigger markers — small X ticks, shown for every symbol
-    # (failed or not) at every recorded trigger within the chart
-    # window.
     trigger_markers = [
         t for t in STATE_DATA["triggers"]
         if t.get("symbol") == sym
     ]
 
     for t in trigger_markers:
-
         ts = _safe_ts(t.get("candle_time"))
 
         if ts is None or ts < t0 or ts > t1:
@@ -2855,7 +2057,6 @@ def render_symbol_chart_svg(sym: str) -> str:
 
         tx = x_of(int(ts))
         ty = y_of(t["price"])
-
         sz = 3.5
 
         svg.append(
@@ -2870,8 +2071,6 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'stroke="#7a3fb8" stroke-width="1.3"/>'
         )
 
-    # Order markers — filled circles, only ever present for
-    # non-failed symbols since failed symbols never call place_long.
     orders = [
         o for o in STATE_DATA["orders"]
         if o.get("symbol") == sym
@@ -2880,7 +2079,6 @@ def render_symbol_chart_svg(sym: str) -> str:
     ]
 
     for o in orders:
-
         ts_str = o.get("candle_time") or o.get("timestamp")
         ts = _safe_ts(ts_str)
 
@@ -2891,7 +2089,6 @@ def render_symbol_chart_svg(sym: str) -> str:
         oy = y_of(o["limit_price"])
 
         is_real_fire = "reference_window" in o
-
         marker_color = "#0044cc" if is_real_fire else "#888"
 
         svg.append(
@@ -2899,7 +2096,6 @@ def render_symbol_chart_svg(sym: str) -> str:
             f'fill="{marker_color}" stroke="#fff" stroke-width="1"/>'
         )
 
-    # Legend
     legend_y = CHART_H - 8
 
     svg.append(
@@ -2935,75 +2131,51 @@ def render_symbol_chart_svg(sym: str) -> str:
     )
 
     svg.append("</svg>")
-
     return "\n".join(svg)
 
 
 # ── engine timing ─────────────────────────────────────────────────────────────
 
 def _seconds_until_next_minute_mark() -> float:
-
     now = time.time()
-
     next_mark = (
         (int(now) // 60 + 1) * 60
         + MINUTE_CHECK_SECOND
     )
-
     return next_mark - now
 
 
 # ── engine cycle ─────────────────────────────────────────────────────────────
 
 def engine_cycle():
-
     now_utc = datetime.datetime.now(UTC)
 
-    # Contribution-weighting recompute FIRST, if due — must have a
-    # value available before any trigger this cycle can call
-    # add_trigger_dollar(). Guarded internally to run at most once
-    # per UTC calendar day; a no-op on every other cycle.
     try:
-
         recompute_contributions_if_due(now_utc.date())
-
     except Exception as e:
-
         log.error(
             f"contribution-weighting recompute check failed: {e}",
             exc_info=True
         )
 
-    # Trading (and trigger-evaluation, for ALL symbols including
-    # failed ones) next — never delayed by chart rendering or
-    # report sending.
     run_minute_checks(now_utc)
 
     svg = render_svg(now_utc)
     STATE.set_svg(svg)
 
-    # Charts rendered AFTER trading logic, for EVERY symbol —
-    # failed symbols get charts too.
     for sym in SYMBOLS:
-
         try:
-
             chart_svg = render_symbol_chart_svg(sym)
             STATE.set_chart_svg(sym, chart_svg)
-
         except Exception as e:
-
             log.error(
                 f"[{sym}] chart render failed: {e}",
                 exc_info=True
             )
 
     try:
-
         maybe_send_daily_report(now_utc)
-
     except Exception as e:
-
         log.error(
             f"daily report check failed: {e}",
             exc_info=True
@@ -3023,8 +2195,17 @@ def engine_cycle():
 # ── engine ────────────────────────────────────────────────────────────────────
 
 def run_engine():
-
     load_specs()
+
+    now_utc = datetime.datetime.now(UTC)
+    log.info("recomputing contribution weights on startup")
+    try:
+        recompute_contributions_if_due(now_utc.date(), force=True)
+    except Exception as e:
+        log.error(
+            f"startup contribution recompute failed: {e}",
+            exc_info=True
+        )
 
     run_startup_test_orders()
 
@@ -3034,75 +2215,49 @@ def run_engine():
     )
 
     for sym in SYMBOLS:
-
         try:
-
             seed_minute_buffer(sym)
-
         except Exception as e:
-
             log.error(
                 f"[{sym}] failed to seed minute buffer: {e}",
                 exc_info=True
             )
 
-    log.info(
-        "engine starting — running initial cycle"
-    )
+    log.info("engine starting — running initial cycle")
 
     try:
-
         engine_cycle()
-
     except Exception as e:
-
         log.error(
             f"initial engine cycle failed: {e}",
             exc_info=True
         )
-
         STATE.set_status(f"error: {e}")
 
     while True:
-
         wait_s = _seconds_until_next_minute_mark()
-
         time.sleep(max(0, wait_s))
 
         try:
-
             engine_cycle()
-
         except Exception as e:
-
             log.error(
                 f"engine cycle failed: {e}",
                 exc_info=True
             )
-
             STATE.set_status(f"error: {e}")
 
 
 # ── HTTP server ───────────────────────────────────────────────────────────────
 
-class Handler(
-    http.server.BaseHTTPRequestHandler
-):
+class Handler(http.server.BaseHTTPRequestHandler):
 
-    def log_message(
-        self,
-        fmt,
-        *args
-    ):
-
+    def log_message(self, fmt, *args):
         pass
 
     def do_GET(self):
-
         if self.path == "/chart.svg":
-
             svg = STATE.get_svg().encode("utf-8")
-
             self.send_response(200)
             self.send_header("Content-Type", "image/svg+xml")
             self.send_header("Content-Length", str(len(svg)))
@@ -3111,17 +2266,14 @@ class Handler(
             self.wfile.write(svg)
 
         elif self.path.startswith("/chart/") and self.path.endswith(".svg"):
-
             sym = self.path[len("/chart/"):-len(".svg")]
 
             if sym not in SYMBOLS:
-
                 self.send_response(404)
                 self.end_headers()
                 return
 
             svg = STATE.get_chart_svg(sym).encode("utf-8")
-
             self.send_response(200)
             self.send_header("Content-Type", "image/svg+xml")
             self.send_header("Content-Length", str(len(svg)))
@@ -3130,7 +2282,6 @@ class Handler(
             self.wfile.write(svg)
 
         elif self.path == "/orders.json":
-
             body = json.dumps(
                 STATE_DATA["orders"], indent=2
             ).encode("utf-8")
@@ -3142,7 +2293,6 @@ class Handler(
             self.wfile.write(body)
 
         elif self.path == "/failed.json":
-
             body = json.dumps(
                 sorted(FAILED_SYMBOLS), indent=2
             ).encode("utf-8")
@@ -3154,7 +2304,6 @@ class Handler(
             self.wfile.write(body)
 
         elif self.path == "/budget.json":
-
             body = json.dumps(
                 {
                     "budget": STATE_DATA["budget"],
@@ -3172,7 +2321,6 @@ class Handler(
             self.wfile.write(body)
 
         elif self.path == "/stats.json":
-
             body = json.dumps(
                 {
                     sym: get_daily_stats_snapshot(sym)
@@ -3187,11 +2335,7 @@ class Handler(
             self.end_headers()
             self.wfile.write(body)
 
-        elif (
-            self.path == "/"
-            or self.path == ""
-        ):
-
+        elif self.path in ("/", ""):
             status = STATE.get_status()
 
             chart_links = " · ".join(
@@ -3240,17 +2384,13 @@ class Handler(
             )
 
             body = html.encode("utf-8")
-
             self.send_response(200)
-            self.send_header(
-                "Content-Type", "text/html; charset=utf-8"
-            )
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         else:
-
             self.send_response(404)
             self.end_headers()
 
@@ -3258,39 +2398,29 @@ class Handler(
 # ── HTTP server thread ────────────────────────────────────────────────────────
 
 def run_server():
-
     server = http.server.ThreadingHTTPServer(
         (HTTP_HOST, HTTP_PORT),
         Handler
     )
-
-    log.info(
-        f"server listening on {HTTP_HOST}:{HTTP_PORT}"
-    )
-
+    log.info(f"server listening on {HTTP_HOST}:{HTTP_PORT}")
     server.serve_forever()
 
 
 # ── entrypoint ────────────────────────────────────────────────────────────────
 
 def main():
-
     if not MEXC_KEY or not MEXC_SECRET:
-
         log.error("MEXC / MEXCSECRET not set")
-
         raise SystemExit(1)
 
     server_thread = threading.Thread(
         target=run_server,
         daemon=True
     )
-
     server_thread.start()
 
     run_engine()
 
 
 if __name__ == "__main__":
-
     main()
