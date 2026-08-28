@@ -246,7 +246,7 @@ SYMBOLS: List[str] = [
     "ETH_USDT",        # proxy for ETHUSD
     "SOL_USDT",        # proxy for SOLUSD
     "XRP_USDT",        # proxy for XRPUSD
-    "INDA_USDT",       # iShares MSCI India ETF
+    # "INDA_USDT",       # iShares MSCI India ETF
     "NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium
     "XAU_USDT",
