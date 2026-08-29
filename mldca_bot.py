@@ -318,6 +318,7 @@ MEXC_BASE   = "https://api.mexc.co"
 
 # ── symbol configuration ──────────────────────────────────────────────────────
 
+
 SYMBOLS: List[str] = [
     "USOIL_USDT",      # proxy for UOILUSD (WTI)
     "URNM_USDT",       # proxy for URNMUSD
@@ -336,7 +337,11 @@ SYMBOLS: List[str] = [
     "HK0700_USDT",     # Tencent Holdings (0700.HK)
     # "INDA_USDT",       # iShares MSCI India ETF
     "EWT_USDT",        # iShares MSCI Taiwan ETF
+    "SMH_USDT",        # VanEck Semiconductor ETF
+    "COPPER_USDT",     # Copper
+    "BKRSTOCK_USDT",   # Baker Hughes
 ]
+
 LEVERAGE = 20
 
 
