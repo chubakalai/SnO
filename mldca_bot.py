@@ -319,19 +319,206 @@ MEXC_BASE   = "https://api.mexc.co"
 # ── symbol configuration ──────────────────────────────────────────────────────
 
 SYMBOLS: List[str] = [
-    "USOIL_USDT",      # proxy for UOILUSD (WTI)
-    "URNM_USDT",       # proxy for URNMUSD
-    "BTC_USDT",        # proxy for BTCUSD
-    "ETH_USDT",        # proxy for ETHUSD
-    "SOL_USDT",        # proxy for SOLUSD
-    "XRP_USDT",        # proxy for XRPUSD
-    # "INDA_USDT",       # iShares MSCI India ETF
-    "NGAS_USDT",       # Natural Gas
-    "XPD_USDT",        # Palladium
+    # Existing
+    "USOIL_USDT",
+    "URNM_USDT",
+    "BTC_USDT",
+    "ETH_USDT",
+    "SOL_USDT",
+    "XRP_USDT",
+    "INDA_USDT",
+    "NGAS_USDT",
+    "XPD_USDT",
     "XAU_USDT",
     "MSTRSTOCK_USDT",
     "UNITREE_USDT",
-  
+
+    # Broad equity indices / ETFs
+    "SPY_USDT",
+    "SPX500_USDT",
+    "IWM_USDT",
+    "US30_USDT",
+    "NAS100_USDT",
+    "QQQSTOCK_USDT",
+    "JP225_USDT",
+    "KOSPI_USDT",
+    "HK50_USDT",
+    "EWY_USDT",
+    "EWJ_USDT",
+    "EWZ_USDT",
+    "EWT_USDT",
+
+    # China / Hong Kong
+    "TENCENTSTOCK_USDT",
+    "HK0700_USDT",
+    "BABASTOCK_USDT",
+    "PDDSTOCK_USDT",
+    "BIDUSTOCK_USDT",
+    "MEITUANSTOCK_USDT",
+    "KUAISHOUSTOCK_USDT",
+    "XIAOMISTOCK_USDT",
+    "NIOSTOCK_USDT",
+    "HK1810_USDT",
+    "POPMARTSTOCK_USDT",
+    "NEO_USDT",
+
+    # Precious metals / commodities
+    "XAUT_USDT",
+    "PAXG_USDT",
+    "SILVER_USDT",
+    "XPT_USDT",
+    "UKOIL_USDT",
+    "USO_USDT",
+    "COPPER_USDT",
+    "ALUMINUM_USDT",
+    "NICKEL_USDT",
+    "ZINC_USDT",
+
+    # Sector ETFs
+    "XLE_USDT",
+    "XLI_USDT",
+    "XLK_USDT",
+    "XLV_USDT",
+    "XLU_USDT",
+    "SOXX_USDT",
+    "SMH_USDT",
+    "IBB_USDT",
+    "XBI_USDT",
+    "VGT_USDT",
+    "VUG_USDT",
+    "ARKK_USDT",
+    "GDX_USDT",
+
+    # US financials
+    "JPMSTOCK_USDT",
+    "BACSTOCK_USDT",
+    "GSSTOCK_USDT",
+    "BLKSTOCK_USDT",
+    "IBKRSTOCK_USDT",
+    "COFSTOCK_USDT",
+    "AXPSTOCK_USDT",
+    "SOFISTOCK_USDT",
+
+    # US healthcare
+    "LLYSTOCK_USDT",
+    "UNHSTOCK_USDT",
+    "AMGNSTOCK_USDT",
+    "BIIBSTOCK_USDT",
+    "VRTXSTOCK_USDT",
+    "GILDSTOCK_USDT",
+    "ISRGSTOCK_USDT",
+
+    # US consumer
+    "WMTSTOCK_USDT",
+    "COSTSTOCK_USDT",
+    "MCDSTOCK_USDT",
+    "KHCSTOCK_USDT",
+    "SBUXSTOCK_USDT",
+
+    # US industrials / aerospace
+    "CATSTOCK_USDT",
+    "GEVSTOCK_USDT",
+    "LMTSTOCK_USDT",
+    "RTXSTOCK_USDT",
+    "GEOD_USDT",
+    "LHXSTOCK_USDT",
+
+    # US energy
+    "XOMSTOCK_USDT",
+    "CVXSTOCK_USDT",
+    "COPSTOCK_USDT",
+    "SLBSTOCK_USDT",
+    "VLOSTOCK_USDT",
+    "MPCSTOCK_USDT",
+    "BKRSTOCK_USDT",
+    "OXYSTOCK_USDT",
+
+    # US technology
+    "AAPLSTOCK_USDT",
+    "MSFTSTOCK_USDT",
+    "GOOGLSTOCK_USDT",
+    "AMZNSTOCK_USDT",
+    "NVIDIA_USDT",
+    "AMDSTOCK_USDT",
+    "INTCSTOCK_USDT",
+    "ORCLSTOCK_USDT",
+    "CRMSTOCK_USDT",
+    "PLTRSTOCK_USDT",
+    "DELLSTOCK_USDT",
+
+    # Semiconductors / AI infrastructure
+    "TSMSTOCK_USDT",
+    "ASMLSTOCK_USDT",
+    "MRVLSTOCK_USDT",
+    "AMATSTOCK_USDT",
+    "LRCXSTOCK_USDT",
+    "KLACSTOCK_USDT",
+    "TERSTOCK_USDT",
+    "ARMSTOCK_USDT",
+    "MUSTOCK_USDT",
+    "SKHYNIXSTOCK_USDT",
+    "SAMSUNGSTOCK_USDT",
+    "SAMSUNGEMSTOCK_USDT",
+    "QCOMSTOCK_USDT",
+    "CDNSSTOCK_USDT",
+    "SNPSSTOCK_USDT",
+    "CIENSTOCK_USDT",
+    "ANETSTOCK_USDT",
+
+    # Korea
+    "SKHYNIXSTOCK_USDC",
+    "HYUNDAISTOCK_USDT",
+    "HANMISTOCK_USDT",
+    "LGELECTRONICS_USDT",
+    "NAVERSTOCK_USDT",
+
+    # Japan
+    "JPY_USDT",
+    "SONYSTOCK_USDT",
+    "TOKYOELSTOCK_USDT",
+    "ADVANTESTSTOCK_USDT",
+    "MUFGSTOCK_USDT",
+    "LASERTECSTOCK_USDT",
+
+    # Real estate
+    "O_USDT",
+    "RE_USDT",
+
+    # FX
+    "EUR_USDT",
+    "GBP_USDT",
+    "CHF_USDT",
+    "AUD_USDT",
+    "CAD_USDT",
+    "BRL_USDT",
+    "TRY_USDT",
+
+    # Leveraged / inverse / volatility
+    "TMF_USDT",
+    "TBT_USDT",
+    "UPRO_USDT",
+    "SQQQ_USDT",
+    "SOXL_USDT",
+    "SOXS_USDT",
+    "TZA_USDT",
+    "DRV_USDT",
+    "UVXY_USDT",
+
+    # Other crypto explicitly mentioned
+    "BNB_USDT",
+    "AVAX_USDT",
+    "ADA_USDT",
+    "DOGE_USDT",
+    "LINK_USDT",
+    "SUI_USDT",
+    "TAO_USDT",
+    "HYPE_USDT",
+    "NEAR_USDT",
+    "AAVE_USDT",
+    "UNI_USDT",
+    "LTC_USDT",
+    "BCH_USDT",
+    "XMR_USDT",
 ]
 
 LEVERAGE = 20
