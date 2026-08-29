@@ -82,9 +82,12 @@ symbols:
      as the column average of the correlation matrix (including the
      1.0 self-correlation term).
   5. Compute annualized volatility from the daily return series.
-  6. Compute parameter z = (1 - avg_correlation) * (1 - ann_vol).
-     Symbols that are less correlated with the rest of the book and
-     less volatile score a higher z.
+  6. Compute parameter z = (1 - avg_correlation_capped) *
+     (1 - ann_vol_capped), where avg_correlation_capped and
+     ann_vol_capped are each clamped to the range [-1.0, 1.0] and
+     [0.0, 1.0] respectively before use — see VOLATILITY / CORRELATION
+     CAPPING below. Symbols that are less correlated with the rest
+     of the book and less volatile score a higher z.
   7. Normalize z across all symbols into a weight w_x (sums to 1).
   8. Convert to a per-trigger USD contribution:
        contribution = BASE_TRIGGER_USD * num_symbols * w_x
@@ -104,6 +107,40 @@ endpoint is unreachable), EVERY symbol falls back to flat
 BASE_TRIGGER_USD ($1.00) for that day, and recompute is retried at
 the next daily cycle. This is a pure fallback, not a cached carry-
 forward — a failed recompute does not reuse yesterday's values.
+
+═══════════════════════════════════════════════════════════════════
+VOLATILITY / CORRELATION CAPPING (z-score stability)
+═══════════════════════════════════════════════════════════════════
+
+The z-score formula z = (1 - avg_correlation) * (1 - ann_vol) is
+only well-behaved — i.e. guaranteed to stay non-negative — when both
+avg_correlation and ann_vol stay within [-1, 1] and [0, 1]
+respectively. Annualized volatility, in particular, is UNBOUNDED
+ABOVE: for a genuinely volatile instrument (crypto majors, single
+stocks, or any symbol going through a turbulent 30-day window),
+ann_vol can readily exceed 1.0 (100%). Left uncapped, the term
+(1 - ann_vol) goes negative, which can drive that symbol's z-score
+negative, which in turn:
+  - produces a negative or distorted weight w_x, and therefore a
+    negative or distorted per-trigger USD contribution for that
+    symbol, potentially causing add_trigger_dollar to shrink rather
+    than grow the accumulator on a trigger, and
+  - can drag total_z toward zero or negative across the whole book,
+    silently forcing every symbol back to equal-weighting for that
+    cycle (masking the underlying issue rather than resolving it).
+
+To prevent this, BOTH inputs to the z-score are clamped immediately
+before use, every recompute cycle:
+  - ann_vol is clamped to [0.0, CONTRIB_VOL_CAP]      (CONTRIB_VOL_CAP = 1.0)
+  - avg_cor is clamped to [-CONTRIB_CORR_CAP, CONTRIB_CORR_CAP]
+                                                       (CONTRIB_CORR_CAP = 1.0)
+This guarantees (1 - ann_vol_capped) in [0, 1] and
+(1 - avg_cor_capped) in [0, 2], so z_scores[sym] is always >= 0,
+total_z is always >= 0, and no symbol can receive a negative
+per-trigger contribution from this mechanism. A symbol whose raw
+volatility is clamped is logged so the event is visible; the clamp
+does not change the underlying raw volatility figure used elsewhere
+(e.g. in log output), only the number fed into the z-score.
 
 ═══════════════════════════════════════════════════════════════════
 DATE ALIGNMENT (contribution-weighting inputs)
@@ -318,6 +355,16 @@ MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 BASE_TRIGGER_USD = 1.0   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
 
 CONTRIB_LOOKBACK_DAYS = 90
+
+# Caps applied to annualized volatility and average correlation
+# immediately before they enter the z-score formula
+# z = (1 - avg_cor) * (1 - ann_vol). Without these caps, ann_vol in
+# particular is unbounded above and can exceed 1.0 for genuinely
+# volatile symbols, driving (1 - ann_vol) — and therefore the whole
+# z-score and downstream per-trigger USD contribution — negative.
+# See "VOLATILITY / CORRELATION CAPPING" in the module docstring.
+CONTRIB_VOL_CAP  = 1.0   # ann_vol clamped to [0.0, CONTRIB_VOL_CAP]
+CONTRIB_CORR_CAP = 1.0   # avg_cor clamped to [-CONTRIB_CORR_CAP, CONTRIB_CORR_CAP]
 
 
 # ── chart constants ────────────────────────────────────────────────────────────
@@ -534,7 +581,14 @@ def compute_daily_returns_ordered(
 
 
 def calculate_volatility(returns: List[float]) -> tuple:
-    """Calculates daily standard deviation and annualized volatility."""
+    """Calculates daily standard deviation and annualized volatility.
+
+    Both returned values are raw (uncapped) figures. Callers that
+    feed annualized volatility into the z-score formula must apply
+    CONTRIB_VOL_CAP themselves — see compute_contribution_weights —
+    rather than relying on this function to clamp, so that raw
+    volatility remains available for logging/diagnostics undistorted.
+    """
     n = len(returns)
     if n < 2:
         return 0.0, 0.0
@@ -567,6 +621,10 @@ def calculate_pearson_correlation(x: List[float], y: List[float]) -> float:
 
     std_dev = math.sqrt(var_x * var_y)
     return cov / std_dev if std_dev != 0 else 0.0
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float]]:
@@ -651,10 +709,39 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
         col_sum = sum(corr_matrix[row_sym][col_sym] for row_sym in symbols)
         col_averages[col_sym] = col_sum / num_assets
 
+    # ── z-score computation, with volatility/correlation capping ──
+    #
+    # ann_vol is unbounded above and routinely exceeds 1.0 (100%)
+    # for genuinely volatile symbols. Left uncapped, (1 - ann_vol)
+    # goes negative, which can drive z negative and, downstream, a
+    # negative or distorted per-trigger USD contribution. Both
+    # inputs are clamped immediately before entering the formula;
+    # the raw (uncapped) annualized volatility is still used for
+    # logging so the true figure remains visible in operational
+    # output even when the capped figure is what drives sizing.
     z_scores: Dict[str, float] = {}
     for sym in symbols:
-        avg_cor = col_averages[sym]
-        ann_vol = vol_data[sym]["annualized"]
+        raw_avg_cor = col_averages[sym]
+        raw_ann_vol = vol_data[sym]["annualized"]
+
+        avg_cor = _clamp(raw_avg_cor, -CONTRIB_CORR_CAP, CONTRIB_CORR_CAP)
+        ann_vol = _clamp(raw_ann_vol, 0.0, CONTRIB_VOL_CAP)
+
+        if raw_ann_vol > CONTRIB_VOL_CAP:
+            log.warning(
+                f"[{sym}] annualized volatility {raw_ann_vol:.3f} "
+                f"exceeds cap {CONTRIB_VOL_CAP:.3f} — clamped to "
+                f"{ann_vol:.3f} for z-score purposes (raw figure "
+                "retained for diagnostics)"
+            )
+
+        if abs(raw_avg_cor) > CONTRIB_CORR_CAP:
+            log.warning(
+                f"[{sym}] avg correlation {raw_avg_cor:.3f} exceeds "
+                f"cap magnitude {CONTRIB_CORR_CAP:.3f} — clamped to "
+                f"{avg_cor:.3f} for z-score purposes"
+            )
+
         z_scores[sym] = (1 - avg_cor) * (1 - ann_vol)
 
     total_z = sum(z_scores.values())
