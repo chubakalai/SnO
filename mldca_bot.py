@@ -325,13 +325,17 @@ SYMBOLS: List[str] = [
     "ETH_USDT",        # proxy for ETHUSD
     "SOL_USDT",        # proxy for SOLUSD
     "XRP_USDT",        # proxy for XRPUSD
-    # "INDA_USDT",       # iShares MSCI India ETF
     "NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium
-    "XAU_USDT",
-    "MSTRSTOCK_USDT",
+    "XAU_USDT",        # Gold
+    "MSTRSTOCK_USDT",  # MicroStrategy
     "UNITREE_USDT",
-  
+    "SPX500_USDT",     # S&P 500 Index
+    "EWJ_USDT",        # iShares MSCI Japan ETF
+    "EWY_USDT",        # iShares MSCI South Korea ETF
+    "HK0700_USDT",     # Tencent Holdings (0700.HK)
+    # "INDA_USDT",       # iShares MSCI India ETF
+    "EWT_USDT",        # iShares MSCI Taiwan ETF
 ]
 LEVERAGE = 20
 
