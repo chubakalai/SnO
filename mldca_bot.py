@@ -34,9 +34,11 @@ EVERY symbol, including FAILED ones — see FAILED SYMBOLS below):
        - budget >= 0  -> reference is the rolling 2-day low
        - budget <  0  -> reference is the rolling 9-day low
      Both are computed from the trailing window of closed 1-minute
-     candles (2 days = 2880 minutes, 9 days = 12960 minutes).
-  3. If the closed candle's low is <= that reference low, it is a
-     TRIGGER.
+     candles (2 days = 2880 minutes, 9 days = 12960 minutes),
+     EXCLUDING the current (most recently closed) candle itself —
+     see STRICT NEW-LOW SEMANTICS below.
+  3. If the closed candle's low is STRICTLY LESS THAN that
+     reference low, it is a TRIGGER.
   4. For NON-FAILED symbols only: a trigger adds that symbol's
      CURRENT per-trigger contribution (see CONTRIBUTION WEIGHTING
      below) to the pending accumulator, and if the accumulator's
@@ -58,6 +60,35 @@ Rolling 1-minute OHLC candle buffer (per symbol):
     failed status.
   - Powers both the trigger-reference lows AND the 15m-resampled
     10-day chart (see CHARTS below).
+
+═══════════════════════════════════════════════════════════════════
+STRICT NEW-LOW SEMANTICS
+═══════════════════════════════════════════════════════════════════
+
+A trigger requires the most recently closed candle's low to be a
+genuine new low relative to the rest of the reference window — that
+is, STRICTLY LOWER than every OTHER candle's low in that window —
+rather than merely being less-than-or-equal-to the window minimum
+(which, since the current candle is itself a member of that window,
+would be trivially satisfied whenever the current candle ties or
+sets the minimum, including tying itself).
+
+To enforce this:
+  - The reference low (2d or 9d, per the budget-sign rule above) is
+    computed over the window EXCLUDING the current candle, via
+    rolling_low(..., exclude_latest=True).
+  - The trigger condition uses strict inequality:
+        triggered = candle_low < ref_low
+    rather than <=.
+  - If, after excluding the current candle, no other candles remain
+    in the window (e.g. very early in the buffer's life), there is
+    no prior low to compare against and the check is skipped for
+    that minute, exactly as when the buffer has no data at all.
+
+This affects trigger evaluation only. It does not change how the
+reference low is displayed on charts (chart threshold lines still
+reflect the standard rolling low over the full window, current
+candle included, for visual continuity with the plotted candles).
 
 ═══════════════════════════════════════════════════════════════════
 CONTRIBUTION WEIGHTING (per-symbol $ per trigger)
@@ -198,8 +229,10 @@ OHLC candles (~960 candles). The chart marks:
     line. For failed symbols (budget frozen at 0 or whatever it was
     at time of failure), this still reflects budget sign the same
     way.
-  - Every TRIGGER (candle low <= reference low) as a small tick
-    marker on the price axis at that candle's time/price.
+  - Every TRIGGER (candle low strictly less than the reference low,
+    excluding the current candle — see STRICT NEW-LOW SEMANTICS) as
+    a small tick marker on the price axis at that candle's
+    time/price.
   - Every REAL ORDER placed for that symbol (never happens for
     failed symbols) as a filled circle marker at its fire
     time/price.
@@ -335,7 +368,7 @@ SYMBOLS: List[str] = [
     "EWJ_USDT",        # iShares MSCI Japan ETF
     "EWY_USDT",        # iShares MSCI South Korea ETF
     "HK0700_USDT",     # Tencent Holdings (0700.HK)
-    # "INDA_USDT",       # iShares MSCI India ETF
+    "INDA_USDT",       # iShares MSCI India ETF
     "EWT_USDT",        # iShares MSCI Taiwan ETF
     "SMH_USDT",        # VanEck Semiconductor ETF
     "COPPER_USDT",     # Copper
@@ -1598,13 +1631,35 @@ class MinuteBuffer:
                 return None
             return self.bars[-1]
 
-    def rolling_low(self, window_minutes: int) -> Optional[float]:
+    def rolling_low(
+        self,
+        window_minutes: int,
+        exclude_latest: bool = False
+    ) -> Optional[float]:
+        """Returns the minimum low across closed candles within the
+        trailing window_minutes.
+
+        If exclude_latest is True, the most recent bar in the buffer
+        (i.e. the current/just-closed candle under evaluation) is
+        omitted from the set being scanned, so the result reflects
+        only PRIOR candles in the window. This is required for
+        strict new-low trigger evaluation — see STRICT NEW-LOW
+        SEMANTICS in the module docstring — where the current
+        candle must be compared against the rest of the window
+        rather than against a set that trivially includes itself.
+        """
         with self.lock:
             if not self.bars:
                 return None
 
             cutoff = int(time.time()) - window_minutes * 60
-            window = [b["l"] for b in self.bars if b["t"] >= cutoff]
+
+            bars = self.bars
+
+            if exclude_latest:
+                bars = list(bars)[:-1]
+
+            window = [b["l"] for b in bars if b["t"] >= cutoff]
 
             if not window:
                 return None
@@ -1763,21 +1818,29 @@ def evaluate_trigger(sym: str, now_utc: datetime.datetime):
         ref_window = ROLL_MINUTES_LONG
         ref_label = "9d"
 
-    ref_low = buf.rolling_low(ref_window)
+    # exclude_latest=True: the reference low must reflect only
+    # candles PRIOR to the one currently under evaluation, so that
+    # a trigger requires a genuine new low relative to the rest of
+    # the window rather than the current candle trivially matching
+    # itself as the window minimum. See STRICT NEW-LOW SEMANTICS.
+    ref_low = buf.rolling_low(ref_window, exclude_latest=True)
 
     if ref_low is None:
         log.warning(
-            f"[{sym}] insufficient buffer data to compute "
-            f"{ref_label} low — skipping this minute"
+            f"[{sym}] insufficient prior-candle data to compute "
+            f"{ref_label} low (excluding current candle) — "
+            "skipping this minute"
         )
         return None
 
-    triggered = candle_low <= ref_low
+    # Strict inequality: the current candle's low must be lower
+    # than every other low in the window, not merely tied with it.
+    triggered = candle_low < ref_low
 
     log.info(
         f"[{sym}] minute check {candle_dt.isoformat()}: "
         f"low={candle_low:.4f} "
-        f"{ref_label}Low={ref_low:.4f} "
+        f"{ref_label}Low(prior)={ref_low:.4f} "
         f"budget={budget:.2f} "
         f"failed={is_failed(sym)} "
         f"trigger={triggered}"
