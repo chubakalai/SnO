@@ -71,17 +71,22 @@ symbols:
 
   1. For each symbol, fetch 30 days of daily closes and compute
      daily returns.
-  2. Build the full pairwise Pearson correlation matrix across all
-     symbols' daily returns.
-  3. For each symbol, compute its "relative portfolio correlation"
+  2. DATE-ALIGN all symbols' daily-close series onto the intersection
+     of UTC calendar dates present across every symbol, sorted
+     chronologically, BEFORE computing returns — so that return
+     series are compared date-for-date rather than index-for-index.
+     (See DATE ALIGNMENT below.)
+  3. Build the full pairwise Pearson correlation matrix across all
+     symbols' (now date-aligned) daily returns.
+  4. For each symbol, compute its "relative portfolio correlation"
      as the column average of the correlation matrix (including the
      1.0 self-correlation term).
-  4. Compute annualized volatility from the daily return series.
-  5. Compute parameter z = (1 - avg_correlation) * (1 - ann_vol).
+  5. Compute annualized volatility from the daily return series.
+  6. Compute parameter z = (1 - avg_correlation) * (1 - ann_vol).
      Symbols that are less correlated with the rest of the book and
      less volatile score a higher z.
-  6. Normalize z across all symbols into a weight w_x (sums to 1).
-  7. Convert to a per-trigger USD contribution:
+  7. Normalize z across all symbols into a weight w_x (sums to 1).
+  8. Convert to a per-trigger USD contribution:
        contribution = BASE_TRIGGER_USD * num_symbols * w_x
      Under equal weighting this reduces to exactly BASE_TRIGGER_USD
      ($1.00) per symbol, matching prior flat-$1 behavior. A symbol
@@ -99,6 +104,26 @@ endpoint is unreachable), EVERY symbol falls back to flat
 BASE_TRIGGER_USD ($1.00) for that day, and recompute is retried at
 the next daily cycle. This is a pure fallback, not a cached carry-
 forward — a failed recompute does not reuse yesterday's values.
+
+═══════════════════════════════════════════════════════════════════
+DATE ALIGNMENT (contribution-weighting inputs)
+═══════════════════════════════════════════════════════════════════
+
+Per-symbol daily closes are fetched independently, and different
+instruments (equities-style proxies vs. commodities vs. crypto) can
+have gapped, missing, or differently-timestamped daily candles. To
+avoid comparing returns at the same ARRAY INDEX but different
+CALENDAR DATES (which silently corrupts the correlation matrix),
+each symbol's raw {timestamp: close} map is first converted to a
+{UTC date: close} map (collapsing any intraday timestamp noise onto
+the calendar date). The set of common dates present for EVERY
+symbol (the intersection) is then computed, sorted chronologically,
+and every symbol's return series is derived from that same ordered
+date list. If the resulting intersection is too small to compute a
+meaningful return series (fewer than 2 common dates), that symbol
+contributes an empty return series for this cycle, exactly as if
+its fetch had failed, and its z-score is computed from n=0 returns
+(daily/annualized volatility 0.0, correlation 0.0 vs. all peers).
 
 ═══════════════════════════════════════════════════════════════════
 FAILED SYMBOLS
@@ -195,6 +220,23 @@ STARTUP TEST ORDERS
     for exactly what that does and doesn't exclude. A test order
     that fills during the wait is NOT a failure.
 
+═══════════════════════════════════════════════════════════════════
+LEVERAGE
+═══════════════════════════════════════════════════════════════════
+
+A single global LEVERAGE constant expresses the desired leverage
+for every symbol. However, each MEXC contract independently caps
+the maximum leverage it will accept (reported as "maxLeverage" in
+the contract-detail response fetched at startup). At every order
+placement (startup test orders AND minute-trigger real orders),
+the effective leverage submitted to the exchange is:
+
+    effective_leverage = min(LEVERAGE, symbol's maxLeverage)
+
+If the exchange does not report a maxLeverage for a given contract,
+the global LEVERAGE is used unmodified for that symbol as a safe
+fallback (no artificial cap is invented).
+
 Environment (secrets only, not behavior):
   MEXC        - MEXC API key
   MEXCSECRET  - MEXC API secret
@@ -251,6 +293,7 @@ SYMBOLS: List[str] = [
     "XPD_USDT",        # Palladium
     "XAU_USDT",
     "MSTRSTOCK_USDT",
+    "UNITREESTOCK_USDT",
   
 ]
 
@@ -366,7 +409,14 @@ specs: Dict[str, Dict] = {}
 # ── contribution-weighting calculation logic ──────────────────────────────────
 
 def fetch_30d_daily_closes(symbol: str) -> Dict[int, float]:
-    """Fetches trailing N-day daily kline data from MEXC API."""
+    """Fetches trailing N-day daily kline data from MEXC API.
+
+    Returns a dict of {unix_timestamp: close}. Callers that need to
+    compare series across symbols must date-align first — see
+    align_price_series_by_date — rather than relying on raw
+    timestamps or array position, since different symbols' daily
+    candles are not guaranteed to fall on identical timestamps.
+    """
     now_s = int(time.time())
     start_s = now_s - (CONTRIB_LOOKBACK_DAYS * 86400)
     url = (
@@ -393,13 +443,92 @@ def fetch_30d_daily_closes(symbol: str) -> Dict[int, float]:
         return {}
 
 
+def _to_date_keyed(price_dict: Dict[int, float]) -> Dict[datetime.date, float]:
+    """Collapses a {timestamp: close} map onto {UTC date: close}.
+
+    If more than one timestamp falls on the same UTC calendar date
+    (should not normally happen for Day1 candles, but is possible
+    around exchange maintenance/backfill artifacts), the
+    latest-timestamped close for that date wins.
+    """
+    by_date: Dict[datetime.date, float] = {}
+    for ts in sorted(price_dict.keys()):
+        d = datetime.datetime.fromtimestamp(ts, tz=UTC).date()
+        by_date[d] = price_dict[ts]
+    return by_date
+
+
+def align_price_series_by_date(
+    price_dicts: Dict[str, Dict[int, float]]
+) -> Dict[str, "collections.OrderedDict[datetime.date, float]"]:
+    """Date-aligns multiple symbols' {timestamp: close} maps.
+
+    Converts every symbol's raw timestamp-keyed series to a
+    date-keyed series, computes the intersection of UTC calendar
+    dates present across ALL symbols that returned any data, sorts
+    that intersection chronologically, and returns each symbol's
+    series restricted to exactly that common, ordered date list.
+
+    This guarantees that index i in every returned series refers to
+    the same calendar date for every symbol, so that downstream
+    return/volatility/correlation calculations are comparing
+    like-for-like periods rather than misaligned array positions.
+
+    Symbols with no data at all are returned with an empty series.
+    """
+    date_keyed: Dict[str, Dict[datetime.date, float]] = {
+        sym: _to_date_keyed(pd) for sym, pd in price_dicts.items()
+    }
+
+    non_empty = [d for d in date_keyed.values() if d]
+
+    if not non_empty:
+        return {sym: collections.OrderedDict() for sym in price_dicts}
+
+    common_dates = set(non_empty[0].keys())
+    for d in non_empty[1:]:
+        common_dates &= set(d.keys())
+
+    ordered_dates = sorted(common_dates)
+
+    aligned: Dict[str, "collections.OrderedDict[datetime.date, float]"] = {}
+    for sym, dkeyed in date_keyed.items():
+        series = collections.OrderedDict()
+        for d in ordered_dates:
+            if d in dkeyed:
+                series[d] = dkeyed[d]
+        aligned[sym] = series
+
+    return aligned
+
+
 def compute_daily_returns(price_dict: Dict[int, float]) -> List[float]:
-    """Calculates daily percentage returns."""
-    sorted_ts = sorted(price_dict.keys())
+    """Calculates daily percentage returns from a chronologically
+    ordered {key: close} mapping (keys may be timestamps or dates;
+    only insertion/sort order of the values matters here)."""
+    sorted_keys = sorted(price_dict.keys())
     returns = []
-    for i in range(1, len(sorted_ts)):
-        prev_p = price_dict[sorted_ts[i - 1]]
-        curr_p = price_dict[sorted_ts[i]]
+    for i in range(1, len(sorted_keys)):
+        prev_p = price_dict[sorted_keys[i - 1]]
+        curr_p = price_dict[sorted_keys[i]]
+        returns.append((curr_p - prev_p) / prev_p)
+    return returns
+
+
+def compute_daily_returns_ordered(
+    series: "collections.OrderedDict"
+) -> List[float]:
+    """Calculates daily percentage returns from an already
+    date-ordered OrderedDict, preserving its existing order rather
+    than re-sorting by key. Used for date-aligned series where the
+    keys are datetime.date objects already in chronological order."""
+    values = list(series.values())
+    returns = []
+    for i in range(1, len(values)):
+        prev_p = values[i - 1]
+        curr_p = values[i]
+        if prev_p == 0:
+            continue
         returns.append((curr_p - prev_p) / prev_p)
     return returns
 
@@ -417,7 +546,15 @@ def calculate_volatility(returns: List[float]) -> tuple:
 
 
 def calculate_pearson_correlation(x: List[float], y: List[float]) -> float:
-    """Calculates Pearson correlation coefficient."""
+    """Calculates Pearson correlation coefficient.
+
+    Callers are expected to pass in date-aligned return series (same
+    length, each index i referring to the same calendar-date
+    transition for both x and y). This function itself only
+    truncates to the shorter length as a defensive fallback; the
+    real alignment guarantee is provided upstream by
+    align_price_series_by_date.
+    """
     n = min(len(x), len(y))
     if n < 2:
         return 0.0
@@ -433,9 +570,7 @@ def calculate_pearson_correlation(x: List[float], y: List[float]) -> float:
 
 
 def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float]]:
-    returns_data: Dict[str, List[float]] = {}
-    vol_data: Dict[str, Dict[str, float]] = {}
-
+    raw_closes: Dict[str, Dict[int, float]] = {}
     any_fetch_succeeded = False
 
     for sym in symbols:
@@ -456,10 +591,8 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
             )
         if closes:
             any_fetch_succeeded = True
-        rets = compute_daily_returns(closes) if closes else []
-        returns_data[sym] = rets
-        d_vol, a_vol = calculate_volatility(rets)
-        vol_data[sym] = {"daily": d_vol, "annualized": a_vol}
+
+        raw_closes[sym] = closes
 
     if not any_fetch_succeeded:
         log.error(
@@ -468,6 +601,38 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
             "to flat BASE_TRIGGER_USD for every symbol"
         )
         return None
+
+    # Date-align every symbol's series onto the common intersection
+    # of UTC calendar dates BEFORE computing returns, so that return
+    # series are compared date-for-date rather than by raw array
+    # index (which could otherwise silently mix mismatched dates
+    # across symbols with different trading calendars/candle gaps).
+    aligned = align_price_series_by_date(raw_closes)
+
+    common_date_count = max((len(s) for s in aligned.values()), default=0)
+    log.info(
+        f"contribution-weighting: date-aligned to "
+        f"{common_date_count} common UTC calendar date(s) "
+        f"across {len(symbols)} symbols"
+    )
+
+    returns_data: Dict[str, List[float]] = {}
+    vol_data: Dict[str, Dict[str, float]] = {}
+
+    for sym in symbols:
+        series = aligned.get(sym, collections.OrderedDict())
+
+        if len(series) < 2:
+            log.warning(
+                f"[{sym}] fewer than 2 dates survived alignment to "
+                "the common date set — treating as empty return "
+                "series for this recompute cycle"
+            )
+
+        rets = compute_daily_returns_ordered(series)
+        returns_data[sym] = rets
+        d_vol, a_vol = calculate_volatility(rets)
+        vol_data[sym] = {"daily": d_vol, "annualized": a_vol}
 
     num_assets = len(symbols)
     corr_matrix: Dict[str, Dict[str, float]] = {s1: {} for s1 in symbols}
@@ -1026,11 +1191,20 @@ def load_specs():
         raw = f"{vu:.10f}".rstrip("0")
         p = len(raw.split(".")[1]) if "." in raw else 0
 
+        max_lev_raw = match.get("maxLeverage")
+        try:
+            max_lev = float(max_lev_raw) if max_lev_raw is not None else None
+            if max_lev is not None and max_lev <= 0:
+                max_lev = None
+        except Exception:
+            max_lev = None
+
         specs[sym] = {
             "p": p,
             "t": pu,
             "vu": vu,
             "cs": cs,
+            "max_lev": max_lev,
         }
 
         log.info(f"loaded specs for {sym}: {specs[sym]}")
@@ -1069,6 +1243,28 @@ def _contracts(sym, usd, price):
 
 def _mos(sym):
     return specs.get(sym, {}).get("vu", 1.0)
+
+
+def _effective_leverage(sym: str) -> int:
+    """Returns the leverage to actually submit with orders for this
+    symbol: the global LEVERAGE, capped at the exchange-reported
+    maxLeverage for that contract if one is known. Falls back to
+    the global LEVERAGE unmodified when maxLeverage was not reported
+    or could not be parsed at spec-load time."""
+    max_lev = specs.get(sym, {}).get("max_lev")
+
+    if max_lev is None:
+        return LEVERAGE
+
+    if max_lev < LEVERAGE:
+        log.info(
+            f"[{sym}] global leverage {LEVERAGE}x exceeds exchange "
+            f"maximum {max_lev:.0f}x for this symbol — using "
+            f"{max_lev:.0f}x instead"
+        )
+        return int(max_lev)
+
+    return LEVERAGE
 
 
 # ── open orders ───────────────────────────────────────────────────────────────
@@ -1127,8 +1323,10 @@ def _place_long_contracts(
     limit_price: float,
     vol: float
 ) -> Optional[str]:
+    leverage = _effective_leverage(sym)
+
     body = {
-        "leverage": LEVERAGE,
+        "leverage": leverage,
         "openType": 2,
         "positionMode": 1,
         "price": _rfmt_price(sym, limit_price),
@@ -1162,6 +1360,7 @@ def _place_long_contracts(
         f"[{sym}] limit LONG "
         f"{_rfmt_vol(sym, vol)} "
         f"@ {_rfmt_price(sym, limit_price)} "
+        f"leverage={leverage}x "
         f"id={oid}"
     )
 
@@ -1715,7 +1914,8 @@ def _open_test_order(sym: str) -> Optional[Dict]:
             f"mark={mark:.4f} "
             f"limit={test_price:.4f} "
             f"(-{(1 - TEST_ORDER_DISCOUNT) * 100:.0f}%) "
-            f"vol={min_vol} (exchange minimum)"
+            f"vol={min_vol} (exchange minimum) "
+            f"leverage={_effective_leverage(sym)}x"
         )
 
         oid = place_long_min_size(sym, test_price)
@@ -1866,10 +2066,12 @@ def render_svg(now_utc: datetime.datetime) -> str:
             if o.get("symbol") == sym and "reference_window" in o
         )
 
+        eff_lev = _effective_leverage(sym)
+
         if failed:
             clr = "#cc0000"
             line = (
-                f"{sym:<16} "
+                f"{sym:<18} "
                 "*** FAILED — EXCLUDED FROM TRADING "
                 "(chart & triggers still tracked) ***  "
                 f"2dLow={low2d_str:>12}  9dLow={low9d_str:>12}"
@@ -1877,10 +2079,11 @@ def render_svg(now_utc: datetime.datetime) -> str:
         else:
             clr = "#1155cc" if budget >= 0 else "#cc7a00"
             line = (
-                f"{sym:<16} "
+                f"{sym:<18} "
                 f"budget=${budget:>8,.2f}  "
                 f"accum=${accum:>5,.2f}  "
                 f"contrib=${contrib:>5,.3f}/trig  "
+                f"lev={eff_lev:>3}x  "
                 f"ref={ref}  "
                 f"2dLow={low2d_str:>12}  "
                 f"9dLow={low9d_str:>12}  "
@@ -1965,6 +2168,7 @@ def render_symbol_chart_svg(sym: str) -> str:
     title_suffix = _xml_escape(
         (" [FAILED — excluded from trading]" if failed else "")
         + f" [contrib: ${contrib:.3f}/trigger]"
+        + f" [lev: {_effective_leverage(sym)}x]"
     )
 
     svg = [
@@ -2335,6 +2539,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif self.path == "/leverage.json":
+            body = json.dumps(
+                {
+                    sym: {
+                        "global_leverage": LEVERAGE,
+                        "max_leverage": specs.get(sym, {}).get("max_lev"),
+                        "effective_leverage": _effective_leverage(sym),
+                    }
+                    for sym in SYMBOLS
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif self.path in ("/", ""):
             status = STATE.get_status()
 
@@ -2376,6 +2599,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "<a href='/budget.json'>budget/accumulator/contribution</a>"
                 " · "
                 "<a href='/stats.json'>current stats</a>"
+                " · "
+                "<a href='/leverage.json'>leverage per symbol</a>"
                 " · "
                 "<a href='/failed.json'>failed symbols</a>"
                 "</p>"
