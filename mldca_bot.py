@@ -94,14 +94,13 @@ candle included, for visual continuity with the plotted candles).
 CONTRIBUTION WEIGHTING (per-symbol $ per trigger)
 ═══════════════════════════════════════════════════════════════════
 
-Instead of a flat $1.00 added to the accumulator on every trigger
-for every symbol equally, each symbol's per-trigger contribution is
-scaled by a daily-recomputed allocation weight, derived from a
-30-day trailing correlation / volatility analysis across all traded
-symbols:
+Each symbol's per-trigger contribution is scaled by a daily-
+recomputed allocation weight, derived from a trailing daily-close
+correlation / volatility analysis across all traded symbols, using
+an ITERATIVE FIXED-POINT weighting scheme:
 
-  1. For each symbol, fetch 30 days of daily closes and compute
-     daily returns.
+  1. For each symbol, fetch CONTRIB_LOOKBACK_DAYS of daily closes
+     and compute daily returns.
   2. DATE-ALIGN all symbols' daily-close series onto the intersection
      of UTC calendar dates present across every symbol, sorted
      chronologically, BEFORE computing returns — so that return
@@ -110,18 +109,32 @@ symbols:
   3. Build the full pairwise Pearson correlation matrix across all
      symbols' (now date-aligned) daily returns.
   4. For each symbol, compute its "relative portfolio correlation"
-     as the column average of the correlation matrix (including the
-     1.0 self-correlation term).
-  5. Compute annualized volatility from the daily return series.
-  6. Compute parameter z = (1 - avg_correlation_capped) *
-     (1 - ann_vol_capped), where avg_correlation_capped and
-     ann_vol_capped are each clamped to the range [-1.0, 1.0] and
-     [0.0, 1.0] respectively before use — see VOLATILITY / CORRELATION
-     CAPPING below. Symbols that are less correlated with the rest
-     of the book and less volatile score a higher z.
-  7. Normalize z across all symbols into a weight w_x (sums to 1).
-  8. Convert to a per-trigger USD contribution:
-       contribution = BASE_TRIGGER_USD * num_symbols * w_x
+     as the column average of the correlation matrix EXCLUDING the
+     self-correlation (1.0) term — i.e. averaged over the other
+     (num_assets - 1) symbols only.
+  5. Compute annualized volatility from the daily return series for
+     every symbol, and clamp it to [0.0, CONTRIB_VOL_CAP] before it
+     is used as a divisor in the iteration below (see VOLATILITY
+     CAPPING below) — the raw, uncapped figure is retained
+     separately for logging/diagnostics.
+  6. Solve for a self-consistent weight vector via fixed-point
+     iteration (CONTRIB_ITERATIONS rounds) of:
+
+         w_i  <-  (1 / vol_i_capped) *
+                  sum_{j != i} [ (1 - corr_ij) * (1 - w_j) ]
+
+     renormalizing the full weight vector to sum to 1.0 after every
+     round. Weights start at equal-weight (1 / num_assets) and the
+     iteration is repeated CONTRIB_ITERATIONS times regardless of
+     convergence (a fixed iteration count, not a convergence
+     tolerance check), matching the reference implementation.
+  7. z_i, reported for diagnostics only, is the same expression
+     evaluated once more against the final converged weight vector:
+         z_i = (1 / vol_i_capped) *
+               sum_{j != i} [ (1 - corr_ij) * (1 - w_j) ]
+  8. Convert the final normalized weight to a per-trigger USD
+     contribution:
+         contribution = BASE_TRIGGER_USD * num_symbols * w_x
      Under equal weighting this reduces to exactly BASE_TRIGGER_USD
      ($1.00) per symbol, matching prior flat-$1 behavior. A symbol
      weighted above the equal-weight baseline contributes more than
@@ -130,48 +143,51 @@ symbols:
 This is recomputed ONCE PER UTC CALENDAR DAY (piggybacking on the
 same daily cadence as the budget accrual) and cached in persisted
 state. Every minute-trigger check within that day uses the cached
-per-symbol value — the 30-day-history network fetch is never done
-inside the per-minute hot path.
+per-symbol value — the daily-history network fetch and the
+iterative solve are never done inside the per-minute hot path.
+
+Each recompute cycle also writes a plain-text overview report
+(OVERVIEW_FILENAME) and an SVG correlation/weighting heatmap
+(SVG_FILENAME) to disk, summarizing the same run — see CONTRIBUTION
+REPORTING ARTIFACTS below.
 
 If the recompute fails outright (e.g. the exchange's daily-kline
-endpoint is unreachable), EVERY symbol falls back to flat
+endpoint is unreachable for every symbol, or fewer than 2 symbols
+have usable date-aligned history), EVERY symbol falls back to flat
 BASE_TRIGGER_USD ($1.00) for that day, and recompute is retried at
 the next daily cycle. This is a pure fallback, not a cached carry-
 forward — a failed recompute does not reuse yesterday's values.
 
 ═══════════════════════════════════════════════════════════════════
-VOLATILITY / CORRELATION CAPPING (z-score stability)
+VOLATILITY CAPPING (iterative weighting stability)
 ═══════════════════════════════════════════════════════════════════
 
-The z-score formula z = (1 - avg_correlation) * (1 - ann_vol) is
-only well-behaved — i.e. guaranteed to stay non-negative — when both
-avg_correlation and ann_vol stay within [-1, 1] and [0, 1]
-respectively. Annualized volatility, in particular, is UNBOUNDED
-ABOVE: for a genuinely volatile instrument (crypto majors, single
-stocks, or any symbol going through a turbulent 30-day window),
-ann_vol can readily exceed 1.0 (100%). Left uncapped, the term
-(1 - ann_vol) goes negative, which can drive that symbol's z-score
-negative, which in turn:
-  - produces a negative or distorted weight w_x, and therefore a
-    negative or distorted per-trigger USD contribution for that
-    symbol, potentially causing add_trigger_dollar to shrink rather
-    than grow the accumulator on a trigger, and
-  - can drag total_z toward zero or negative across the whole book,
-    silently forcing every symbol back to equal-weighting for that
-    cycle (masking the underlying issue rather than resolving it).
+Annualized volatility is UNBOUNDED ABOVE: for a genuinely volatile
+instrument (crypto majors, single stocks, or any symbol going
+through a turbulent lookback window), ann_vol can readily exceed
+1.0 (100%). Because ann_vol (capped) is used as a DIVISOR in the
+iterative weighting formula (1 / vol_i_capped), an uncapped or
+near-zero raw volatility could otherwise produce either a distorted
+(if uncapped and very large, shrinking that symbol's influence
+unpredictably relative to the reference implementation's intended
+scale) or numerically unstable (if at or near zero) contribution.
 
-To prevent this, BOTH inputs to the z-score are clamped immediately
-before use, every recompute cycle:
-  - ann_vol is clamped to [0.0, CONTRIB_VOL_CAP]      (CONTRIB_VOL_CAP = 1.0)
-  - avg_cor is clamped to [-CONTRIB_CORR_CAP, CONTRIB_CORR_CAP]
-                                                       (CONTRIB_CORR_CAP = 1.0)
-This guarantees (1 - ann_vol_capped) in [0, 1] and
-(1 - avg_cor_capped) in [0, 2], so z_scores[sym] is always >= 0,
-total_z is always >= 0, and no symbol can receive a negative
-per-trigger contribution from this mechanism. A symbol whose raw
-volatility is clamped is logged so the event is visible; the clamp
-does not change the underlying raw volatility figure used elsewhere
-(e.g. in log output), only the number fed into the z-score.
+To prevent this, BEFORE every iteration cycle:
+  - ann_vol is clamped to [0.0, CONTRIB_VOL_CAP] (CONTRIB_VOL_CAP =
+    1.0) for use as the iteration's divisor.
+  - If the capped ann_vol is at or below a small floor
+    (CONTRIB_VOL_FLOOR = 0.0001), the floor value is used instead,
+    preventing division by zero for a symbol with a degenerate
+    (flat or single-observation) return series.
+A symbol whose raw volatility is clamped is logged so the event is
+visible; the clamp does not change the underlying raw volatility
+figure used elsewhere (e.g. in log output or the overview report),
+only the number fed into the iterative formula.
+
+Pearson correlation coefficients are already bounded to [-1, 1] by
+construction and are used directly in (1 - corr_ij) without a
+separate clamp, consistent with the reference iterative
+implementation.
 
 ═══════════════════════════════════════════════════════════════════
 DATE ALIGNMENT (contribution-weighting inputs)
@@ -184,14 +200,40 @@ avoid comparing returns at the same ARRAY INDEX but different
 CALENDAR DATES (which silently corrupts the correlation matrix),
 each symbol's raw {timestamp: close} map is first converted to a
 {UTC date: close} map (collapsing any intraday timestamp noise onto
-the calendar date). The set of common dates present for EVERY
-symbol (the intersection) is then computed, sorted chronologically,
-and every symbol's return series is derived from that same ordered
-date list. If the resulting intersection is too small to compute a
-meaningful return series (fewer than 2 common dates), that symbol
-contributes an empty return series for this cycle, exactly as if
-its fetch had failed, and its z-score is computed from n=0 returns
-(daily/annualized volatility 0.0, correlation 0.0 vs. all peers).
+the calendar date, retaining the latest-timestamped close for that
+date if more than one falls on it). The set of common dates present
+for EVERY symbol that returned any data (the intersection) is then
+computed, sorted chronologically, and every symbol's return series
+is derived from that same ordered date list. If the resulting
+intersection is too small to compute a meaningful return series
+(fewer than 2 common dates), the recompute treats this the same as
+a total fetch failure and falls back to flat BASE_TRIGGER_USD for
+every symbol, consistent with the reference implementation's
+"insufficient overlapping trading days" abort condition.
+
+═══════════════════════════════════════════════════════════════════
+CONTRIBUTION REPORTING ARTIFACTS
+═══════════════════════════════════════════════════════════════════
+
+In addition to caching the per-symbol USD contribution for use by
+the minute-trigger engine, each successful daily recompute also
+writes two files to disk in the working directory:
+
+  - OVERVIEW_FILENAME ("portfolio_overview_90d.txt"): a structured,
+    human-readable text report covering the aligned date range,
+    correlation-matrix summary statistics, and a per-symbol table
+    of average correlation, annualized volatility (raw and capped),
+    final z-score, normalized weight, and contribution multiple.
+  - SVG_FILENAME ("portfolio_allocation_matrix_90d.svg"): a visual
+    correlation-matrix heatmap plus summary rows for relative
+    portfolio correlation, annualized volatility, parameter z,
+    normalized weight, and contribution per order, for every
+    symbol with usable data.
+
+Both are regenerated in full on every successful recompute and
+overwritten in place; neither is required for trading logic to
+function and a failure to write either is logged but does not
+affect the cached USD contributions already committed to state.
 
 ═══════════════════════════════════════════════════════════════════
 FAILED SYMBOLS
@@ -249,7 +291,10 @@ DAILY ACTIVITY REPORT (ntfy)
 Once per UTC calendar day, at or after 14:00 UTC, a plain-text
 activity report is pushed to the ntfy.sh topic
 "1618091301200506091401140305" (https://ntfy.sh/<topic>), one line
-per symbol, covering activity SINCE THE LAST SUCCESSFULLY SENT
+per symbol, covering EVERY symbol currently configured in SYMBOLS
+(i.e. every actively-monitored symbol, whether presently trading or
+flagged FAILED — no symbol in SYMBOLS is ever omitted from the
+report), summarizing activity SINCE THE LAST SUCCESSFULLY SENT
 REPORT (not since UTC midnight):
   - number of triggers
   - order value (sum of USD on successfully placed orders)
@@ -330,8 +375,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import xml.sax.saxutils as _saxutils
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -397,15 +443,33 @@ BASE_TRIGGER_USD = 1.0   # equal-weight baseline; matches legacy TRIGGER_STACK_U
 
 CONTRIB_LOOKBACK_DAYS = 90
 
-# Caps applied to annualized volatility and average correlation
-# immediately before they enter the z-score formula
-# z = (1 - avg_cor) * (1 - ann_vol). Without these caps, ann_vol in
-# particular is unbounded above and can exceed 1.0 for genuinely
-# volatile symbols, driving (1 - ann_vol) — and therefore the whole
-# z-score and downstream per-trigger USD contribution — negative.
-# See "VOLATILITY / CORRELATION CAPPING" in the module docstring.
-CONTRIB_VOL_CAP  = 1.0   # ann_vol clamped to [0.0, CONTRIB_VOL_CAP]
-CONTRIB_CORR_CAP = 1.0   # avg_cor clamped to [-CONTRIB_CORR_CAP, CONTRIB_CORR_CAP]
+# Cap applied to annualized volatility immediately before it is used
+# as a divisor in the iterative weighting formula
+# w_i <- (1/vol_i) * sum_{j!=i}[(1-corr_ij)*(1-w_j)]. Without this
+# cap, ann_vol is unbounded above and can exceed 1.0 for genuinely
+# volatile symbols, distorting that symbol's influence in the
+# iteration relative to the reference implementation's intended
+# scale. See "VOLATILITY CAPPING" in the module docstring.
+CONTRIB_VOL_CAP   = 1.0     # ann_vol clamped to [0.0, CONTRIB_VOL_CAP]
+CONTRIB_VOL_FLOOR = 0.0001  # floor applied to the capped ann_vol before
+                             # it is used as a divisor, to avoid division
+                             # by zero for a degenerate return series
+
+CONTRIB_ITERATIONS = 50     # fixed-point iteration rounds for the
+                             # iterative weighting solve (matches the
+                             # reference implementation's iteration count)
+
+CONTRIB_MIN_COMMON_DATES = 2  # below this many common aligned dates,
+                               # treat the recompute as a total failure
+                               # and fall back to flat BASE_TRIGGER_USD
+
+# Contribution-weighting reporting artifacts (see CONTRIBUTION
+# REPORTING ARTIFACTS in the module docstring). Written fresh on
+# every successful recompute; a failure to write either is logged
+# but does not affect the cached USD contributions already
+# committed to state.
+OVERVIEW_FILENAME = "portfolio_overview_90d.txt"
+SVG_FILENAME      = "portfolio_allocation_matrix_90d.svg"
 
 
 # ── chart constants ────────────────────────────────────────────────────────────
@@ -548,14 +612,17 @@ def _to_date_keyed(price_dict: Dict[int, float]) -> Dict[datetime.date, float]:
 
 def align_price_series_by_date(
     price_dicts: Dict[str, Dict[int, float]]
-) -> Dict[str, "collections.OrderedDict[datetime.date, float]"]:
+) -> Tuple[List[datetime.date], Dict[str, "collections.OrderedDict[datetime.date, float]"]]:
     """Date-aligns multiple symbols' {timestamp: close} maps.
 
     Converts every symbol's raw timestamp-keyed series to a
     date-keyed series, computes the intersection of UTC calendar
     dates present across ALL symbols that returned any data, sorts
-    that intersection chronologically, and returns each symbol's
-    series restricted to exactly that common, ordered date list.
+    that intersection chronologically, and returns:
+
+      1. The sorted list of common dates (the shared date axis).
+      2. Each symbol's series restricted to exactly that common,
+         ordered date list.
 
     This guarantees that index i in every returned series refers to
     the same calendar date for every symbol, so that downstream
@@ -563,6 +630,7 @@ def align_price_series_by_date(
     like-for-like periods rather than misaligned array positions.
 
     Symbols with no data at all are returned with an empty series.
+    If no symbol has any data, the common-dates list is empty.
     """
     date_keyed: Dict[str, Dict[datetime.date, float]] = {
         sym: _to_date_keyed(pd) for sym, pd in price_dicts.items()
@@ -571,7 +639,7 @@ def align_price_series_by_date(
     non_empty = [d for d in date_keyed.values() if d]
 
     if not non_empty:
-        return {sym: collections.OrderedDict() for sym in price_dicts}
+        return [], {sym: collections.OrderedDict() for sym in price_dicts}
 
     common_dates = set(non_empty[0].keys())
     for d in non_empty[1:]:
@@ -587,20 +655,7 @@ def align_price_series_by_date(
                 series[d] = dkeyed[d]
         aligned[sym] = series
 
-    return aligned
-
-
-def compute_daily_returns(price_dict: Dict[int, float]) -> List[float]:
-    """Calculates daily percentage returns from a chronologically
-    ordered {key: close} mapping (keys may be timestamps or dates;
-    only insertion/sort order of the values matters here)."""
-    sorted_keys = sorted(price_dict.keys())
-    returns = []
-    for i in range(1, len(sorted_keys)):
-        prev_p = price_dict[sorted_keys[i - 1]]
-        curr_p = price_dict[sorted_keys[i]]
-        returns.append((curr_p - prev_p) / prev_p)
-    return returns
+    return ordered_dates, aligned
 
 
 def compute_daily_returns_ordered(
@@ -625,10 +680,11 @@ def calculate_volatility(returns: List[float]) -> tuple:
     """Calculates daily standard deviation and annualized volatility.
 
     Both returned values are raw (uncapped) figures. Callers that
-    feed annualized volatility into the z-score formula must apply
-    CONTRIB_VOL_CAP themselves — see compute_contribution_weights —
-    rather than relying on this function to clamp, so that raw
-    volatility remains available for logging/diagnostics undistorted.
+    feed annualized volatility into the iterative weighting formula
+    must apply CONTRIB_VOL_CAP (and CONTRIB_VOL_FLOOR) themselves —
+    see compute_contribution_weights — rather than relying on this
+    function to clamp, so that raw volatility remains available for
+    logging/diagnostics undistorted.
     """
     n = len(returns)
     if n < 2:
@@ -668,7 +724,279 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _write_contribution_overview_report(
+    symbols: List[str],
+    common_dates: List[datetime.date],
+    corr_matrix: Dict[str, Dict[str, float]],
+    col_averages: Dict[str, float],
+    vol_data: Dict[str, Dict[str, float]],
+    z_scores: Dict[str, float],
+    weights: Dict[str, float],
+    order_contrib: Dict[str, float],
+    filename: str = OVERVIEW_FILENAME,
+):
+    """Writes a structured, human-readable overview of the
+    iterative contribution-weighting recompute to a text file,
+    summarizing the aligned date range, per-symbol metrics, and
+    matrix-level summary statistics. Failure to write is logged and
+    non-fatal — it does not affect the cached USD contributions
+    already committed to state."""
+    try:
+        num_assets = len(symbols)
+
+        off_diag = [
+            corr_matrix[s1][s2]
+            for s1 in symbols
+            for s2 in symbols
+            if s1 != s2
+        ]
+        mean_off_diag = sum(off_diag) / len(off_diag) if off_diag else 0.0
+        min_off_diag = min(off_diag) if off_diag else 0.0
+        max_off_diag = max(off_diag) if off_diag else 0.0
+
+        capped_count = sum(
+            1 for v in vol_data.values() if v["annualized"] > CONTRIB_VOL_CAP
+        )
+
+        lines = []
+        lines.append("=" * 88)
+        lines.append(
+            f"PORTFOLIO OVERVIEW — {CONTRIB_LOOKBACK_DAYS}-Day Lookback, "
+            "Date-Aligned, Iterative Weighting"
+        )
+        lines.append("=" * 88)
+        lines.append(
+            f"Generated (UTC): {datetime.datetime.now(UTC).isoformat()}"
+        )
+        lines.append(f"Requested symbols: {len(SYMBOLS)}")
+        lines.append(f"Symbols with usable data: {num_assets}")
+
+        missing = [s for s in SYMBOLS if s not in symbols]
+        if missing:
+            lines.append(
+                f"Symbols excluded (no data or fetch error): "
+                f"{', '.join(missing)}"
+            )
+
+        if common_dates:
+            lines.append(
+                f"Common aligned date range: {common_dates[0].isoformat()} "
+                f"to {common_dates[-1].isoformat()} "
+                f"({len(common_dates)} trading days, "
+                f"{len(common_dates) - 1} return observations)"
+            )
+        else:
+            lines.append(
+                "Common aligned date range: NONE "
+                "(no overlapping dates across symbols)"
+            )
+
+        lines.append(
+            f"Annualized volatility cap applied to iteration divisor: "
+            f"{CONTRIB_VOL_CAP * 100:.0f}% "
+            f"({capped_count} of {num_assets} symbol(s) exceeded this "
+            "cap and were clamped)"
+        )
+
+        lines.append("")
+        lines.append("-" * 88)
+        lines.append("Correlation Matrix Summary")
+        lines.append("-" * 88)
+        lines.append(f"Mean off-diagonal correlation : {mean_off_diag:+.4f}")
+        lines.append(f"Min off-diagonal correlation   : {min_off_diag:+.4f}")
+        lines.append(f"Max off-diagonal correlation   : {max_off_diag:+.4f}")
+
+        lines.append("")
+        lines.append("-" * 88)
+        lines.append("Per-Symbol Metrics")
+        lines.append("-" * 88)
+        header = (
+            f"{'Symbol':<18} | {'Avg Corr':>9} | {'Ann Vol':>9} | "
+            f"{'Vol Used':>9} | {'z Score':>9} | {'Weight':>8} | "
+            f"{'Contrib/Trig':>12}"
+        )
+        lines.append(header)
+        lines.append("-" * len(header))
+        for sym in symbols:
+            vol_used = min(vol_data[sym]["annualized"], CONTRIB_VOL_CAP)
+            flag = "*" if vol_data[sym]["annualized"] > CONTRIB_VOL_CAP else " "
+            lines.append(
+                f"{sym:<18} | {col_averages[sym]:>9.4f} | "
+                f"{vol_data[sym]['annualized']:>9.4f} | "
+                f"{vol_used:>8.4f}{flag} | {z_scores[sym]:>9.4f} | "
+                f"{weights[sym] * 100:>7.2f}% | "
+                f"{order_contrib[sym]:>11.3f}"
+            )
+        if capped_count:
+            lines.append("")
+            lines.append(
+                "* Ann Vol exceeded the cap; the capped value "
+                "(Vol Used) was applied as the iteration divisor."
+            )
+
+        lines.append("")
+        lines.append(
+            "Sum of weights (sanity check, should equal 1.0000): "
+            f"{sum(weights.values()):.4f}"
+        )
+        lines.append("=" * 88)
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        log.info(f"contribution-weighting overview report saved to: {filename}")
+
+    except Exception as e:
+        log.error(f"failed to write contribution overview report: {e}")
+
+
+def _build_contribution_svg_heatmap(
+    symbols: List[str],
+    corr_matrix: Dict[str, Dict[str, float]],
+    col_averages: Dict[str, float],
+    vol_data: Dict[str, Dict[str, float]],
+    z_scores: Dict[str, float],
+    weights: Dict[str, float],
+    order_contrib: Dict[str, float],
+    filename: str = SVG_FILENAME,
+):
+    """Generates an XML SVG correlation-matrix heatmap plus summary
+    rows for the iterative contribution-weighting recompute.
+    Failure to write is logged and non-fatal — it does not affect
+    the cached USD contributions already committed to state."""
+    try:
+        n = len(symbols)
+        cell_size = 45
+        margin_l, margin_t, margin_r, margin_b = 170, 130, 40, 270
+        width = margin_l + n * cell_size + margin_r
+        height = margin_t + (n + 5) * cell_size + margin_b
+
+        svg = ET.Element('svg', {
+            'xmlns': 'http://www.w3.org/2000/svg',
+            'width': str(width),
+            'height': str(height),
+            'viewBox': f'0 0 {width} {height}',
+            'style': 'background-color: #ffffff; font-family: sans-serif;'
+        })
+
+        title = ET.SubElement(svg, 'text', {
+            'x': str(width / 2), 'y': '40', 'text-anchor': 'middle',
+            'font-size': '16', 'font-weight': 'bold', 'fill': '#333333'
+        })
+        title.text = (
+            f"{CONTRIB_LOOKBACK_DAYS}-Day Date-Aligned Correlation Matrix, "
+            "Parameter z & Contribution per Trigger"
+        )
+
+        for i, sym1 in enumerate(symbols):
+            lbl_y = ET.SubElement(svg, 'text', {
+                'x': str(margin_l - 10),
+                'y': str(margin_t + i * cell_size + cell_size / 1.5),
+                'text-anchor': 'end', 'font-size': '9',
+                'font-weight': 'bold', 'fill': '#333333'
+            })
+            lbl_y.text = sym1
+
+            lbl_x = ET.SubElement(svg, 'text', {
+                'x': str(margin_l + i * cell_size + cell_size / 2),
+                'y': str(margin_t - 10),
+                'text-anchor': 'start', 'font-size': '9',
+                'font-weight': 'bold', 'fill': '#333333',
+                'transform': (
+                    f'rotate(-45, {margin_l + i * cell_size + cell_size / 2}, '
+                    f'{margin_t - 10})'
+                )
+            })
+            lbl_x.text = sym1
+
+            for j, sym2 in enumerate(symbols):
+                val = corr_matrix[sym1][sym2]
+                r, g, b = (
+                    (255, int(255 * (1 - val)), int(255 * (1 - val)))
+                    if val >= 0
+                    else (int(255 * (1 + val)), int(255 * (1 + val)), 255)
+                )
+
+                ET.SubElement(svg, 'rect', {
+                    'x': str(margin_l + j * cell_size),
+                    'y': str(margin_t + i * cell_size),
+                    'width': str(cell_size - 1), 'height': str(cell_size - 1),
+                    'fill': f'rgb({r},{g},{b})', 'rx': '2'
+                })
+
+                txt = ET.SubElement(svg, 'text', {
+                    'x': str(margin_l + j * cell_size + cell_size / 2),
+                    'y': str(margin_t + i * cell_size + cell_size / 1.6),
+                    'text-anchor': 'middle', 'font-size': '8',
+                    'fill': '#000000' if abs(val) < 0.7 else '#ffffff'
+                })
+                txt.text = f"{val:.2f}"
+
+        sep_y = margin_t + n * cell_size + 10
+        ET.SubElement(svg, 'line', {
+            'x1': str(margin_l), 'y1': str(sep_y),
+            'x2': str(margin_l + n * cell_size), 'y2': str(sep_y),
+            'stroke': '#333333', 'stroke-width': '2'
+        })
+
+        summary_rows = [
+            ("Relative Portfolio Corr.", col_averages, "#d9534f",
+             lambda v: f"{v:.2f}"),
+            ("Ann. Volatility (%)",
+             {k: v["annualized"] * 100 for k, v in vol_data.items()},
+             "#0275d8", lambda v: f"{v:.1f}%"),
+            ("Parameter z", z_scores, "#5cb85c", lambda v: f"{v:.3f}"),
+            ("Normalized Weight", weights, "#f0ad4e",
+             lambda v: f"{v * 100:.1f}%"),
+            ("Contrib. per Trigger", order_contrib, "#9c27b0",
+             lambda v: f"{v:.3f}"),
+        ]
+
+        base_y = margin_t + n * cell_size + 20
+
+        for r_idx, (label, data_dict, color, formatter) in enumerate(summary_rows):
+            row_y = base_y + r_idx * (cell_size + 4)
+            lbl = ET.SubElement(svg, 'text', {
+                'x': str(margin_l - 10), 'y': str(row_y + cell_size / 1.5),
+                'text-anchor': 'end', 'font-size': '10',
+                'font-weight': 'bold', 'fill': color
+            })
+            lbl.text = label
+
+            for j, sym in enumerate(symbols):
+                val = data_dict[sym]
+                ET.SubElement(svg, 'rect', {
+                    'x': str(margin_l + j * cell_size), 'y': str(row_y),
+                    'width': str(cell_size - 1), 'height': str(cell_size - 1),
+                    'fill': '#f9f9f9', 'stroke': color,
+                    'stroke-width': '1.5', 'rx': '2'
+                })
+
+                txt = ET.SubElement(svg, 'text', {
+                    'x': str(margin_l + j * cell_size + cell_size / 2),
+                    'y': str(row_y + cell_size / 1.6),
+                    'text-anchor': 'middle', 'font-size': '9',
+                    'font-weight': 'bold', 'fill': color
+                })
+                txt.text = formatter(val)
+
+        tree = ET.ElementTree(svg)
+        ET.indent(tree, space="  ", level=0)
+        tree.write(filename, encoding='utf-8', xml_declaration=True)
+        log.info(f"contribution-weighting heatmap SVG saved to: {filename}")
+
+    except Exception as e:
+        log.error(f"failed to write contribution heatmap SVG: {e}")
+
+
 def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float]]:
+    """Runs the full iterative contribution-weighting recompute:
+    fetch -> date-align -> correlate -> fixed-point-iterate ->
+    normalize -> convert to USD-per-trigger -> write reporting
+    artifacts. Returns None (total failure, caller falls back to
+    flat BASE_TRIGGER_USD for every symbol) if no symbol returned
+    usable data, or if fewer than CONTRIB_MIN_COMMON_DATES common
+    aligned dates survive across all symbols."""
     raw_closes: Dict[str, Dict[int, float]] = {}
     any_fetch_succeeded = False
 
@@ -706,96 +1034,158 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
     # series are compared date-for-date rather than by raw array
     # index (which could otherwise silently mix mismatched dates
     # across symbols with different trading calendars/candle gaps).
-    aligned = align_price_series_by_date(raw_closes)
+    common_dates, aligned = align_price_series_by_date(raw_closes)
 
-    common_date_count = max((len(s) for s in aligned.values()), default=0)
     log.info(
         f"contribution-weighting: date-aligned to "
-        f"{common_date_count} common UTC calendar date(s) "
+        f"{len(common_dates)} common UTC calendar date(s) "
         f"across {len(symbols)} symbols"
     )
+
+    if len(common_dates) < CONTRIB_MIN_COMMON_DATES:
+        log.error(
+            f"contribution-weighting recompute: only "
+            f"{len(common_dates)} common aligned date(s) survived "
+            f"across all symbols, short of the required "
+            f"{CONTRIB_MIN_COMMON_DATES} — treating as a total "
+            "recompute failure, caller will fall back to flat "
+            "BASE_TRIGGER_USD for every symbol"
+        )
+        return None
+
+    # Only symbols that actually have data participate in the
+    # correlation/iteration; a symbol with zero fetched candles has
+    # an empty aligned series and would otherwise contribute
+    # degenerate (all-zero) statistics into the matrix.
+    valid_symbols = [sym for sym in symbols if raw_closes.get(sym)]
+
+    if len(valid_symbols) < 2:
+        log.error(
+            f"contribution-weighting recompute: only "
+            f"{len(valid_symbols)} symbol(s) returned usable data — "
+            "need at least 2 to build a correlation matrix, "
+            "treating as a total recompute failure"
+        )
+        return None
 
     returns_data: Dict[str, List[float]] = {}
     vol_data: Dict[str, Dict[str, float]] = {}
 
-    for sym in symbols:
+    for sym in valid_symbols:
         series = aligned.get(sym, collections.OrderedDict())
-
-        if len(series) < 2:
-            log.warning(
-                f"[{sym}] fewer than 2 dates survived alignment to "
-                "the common date set — treating as empty return "
-                "series for this recompute cycle"
-            )
-
         rets = compute_daily_returns_ordered(series)
         returns_data[sym] = rets
         d_vol, a_vol = calculate_volatility(rets)
         vol_data[sym] = {"daily": d_vol, "annualized": a_vol}
 
-    num_assets = len(symbols)
-    corr_matrix: Dict[str, Dict[str, float]] = {s1: {} for s1 in symbols}
+    num_assets = len(valid_symbols)
+    corr_matrix: Dict[str, Dict[str, float]] = {s1: {} for s1 in valid_symbols}
 
-    for i, sym1 in enumerate(symbols):
-        for j, sym2 in enumerate(symbols):
-            if i == j:
+    # 1. Correlation matrix over the date-aligned window.
+    for sym1 in valid_symbols:
+        for sym2 in valid_symbols:
+            if sym1 == sym2:
                 corr_matrix[sym1][sym2] = 1.0
             else:
                 corr_matrix[sym1][sym2] = calculate_pearson_correlation(
                     returns_data[sym1], returns_data[sym2]
                 )
 
+    # 2. Relative Portfolio Correlation — column averages,
+    #    EXCLUDING the self-correlation (1.0) term, per the
+    #    iterative weighting scheme's definition.
     col_averages: Dict[str, float] = {}
-    for col_sym in symbols:
-        col_sum = sum(corr_matrix[row_sym][col_sym] for row_sym in symbols)
-        col_averages[col_sym] = col_sum / num_assets
+    for col_sym in valid_symbols:
+        if num_assets > 1:
+            col_sum = sum(
+                corr_matrix[row_sym][col_sym]
+                for row_sym in valid_symbols
+                if row_sym != col_sym
+            )
+            col_averages[col_sym] = col_sum / (num_assets - 1)
+        else:
+            col_averages[col_sym] = 0.0
 
-    # ── z-score computation, with volatility/correlation capping ──
-    #
-    # ann_vol is unbounded above and routinely exceeds 1.0 (100%)
-    # for genuinely volatile symbols. Left uncapped, (1 - ann_vol)
-    # goes negative, which can drive z negative and, downstream, a
-    # negative or distorted per-trigger USD contribution. Both
-    # inputs are clamped immediately before entering the formula;
-    # the raw (uncapped) annualized volatility is still used for
-    # logging so the true figure remains visible in operational
-    # output even when the capped figure is what drives sizing.
-    z_scores: Dict[str, float] = {}
-    for sym in symbols:
-        raw_avg_cor = col_averages[sym]
+    # Pre-compute the capped, floored volatility divisor for every
+    # symbol once, ahead of the iteration loop, and log any symbol
+    # whose raw volatility required clamping. See VOLATILITY
+    # CAPPING in the module docstring.
+    vol_divisor: Dict[str, float] = {}
+    for sym in valid_symbols:
         raw_ann_vol = vol_data[sym]["annualized"]
-
-        avg_cor = _clamp(raw_avg_cor, -CONTRIB_CORR_CAP, CONTRIB_CORR_CAP)
-        ann_vol = _clamp(raw_ann_vol, 0.0, CONTRIB_VOL_CAP)
+        capped = _clamp(raw_ann_vol, 0.0, CONTRIB_VOL_CAP)
 
         if raw_ann_vol > CONTRIB_VOL_CAP:
             log.warning(
                 f"[{sym}] annualized volatility {raw_ann_vol:.3f} "
                 f"exceeds cap {CONTRIB_VOL_CAP:.3f} — clamped to "
-                f"{ann_vol:.3f} for z-score purposes (raw figure "
-                "retained for diagnostics)"
+                f"{capped:.3f} for iterative weighting purposes "
+                "(raw figure retained for diagnostics)"
             )
 
-        if abs(raw_avg_cor) > CONTRIB_CORR_CAP:
-            log.warning(
-                f"[{sym}] avg correlation {raw_avg_cor:.3f} exceeds "
-                f"cap magnitude {CONTRIB_CORR_CAP:.3f} — clamped to "
-                f"{avg_cor:.3f} for z-score purposes"
+        vol_divisor[sym] = max(capped, CONTRIB_VOL_FLOOR)
+
+    # 3. Fixed-point iteration to converge on the interdependent
+    #    weights:
+    #        w_i <- (1/vol_i_capped) *
+    #               sum_{j!=i}[(1-corr_ij)*(1-w_j)]
+    #    renormalized to sum to 1.0 after every round. Weights start
+    #    at equal-weight and the loop runs CONTRIB_ITERATIONS times
+    #    unconditionally (fixed count, not a convergence check),
+    #    matching the reference implementation.
+    weights: Dict[str, float] = {sym: 1.0 / num_assets for sym in valid_symbols}
+
+    for _ in range(CONTRIB_ITERATIONS):
+        new_weights: Dict[str, float] = {}
+        for sym1 in valid_symbols:
+            w_sum = sum(
+                (1 - corr_matrix[sym1][sym2]) * (1 - weights[sym2])
+                for sym2 in valid_symbols
+                if sym1 != sym2
             )
+            new_weights[sym1] = (1.0 / vol_divisor[sym1]) * w_sum
 
-        z_scores[sym] = (1 - avg_cor) * (1 - ann_vol)
+        total_new_w = sum(new_weights.values())
+        if total_new_w > 0:
+            weights = {
+                sym: w / total_new_w for sym, w in new_weights.items()
+            }
+        # If total_new_w <= 0 (degenerate case), retain the previous
+        # round's weights rather than dividing by zero or collapsing
+        # to an undefined state.
 
-    total_z = sum(z_scores.values())
+    # 4. z-scores, reported for diagnostics only: the same
+    #    expression evaluated once more against the final converged
+    #    weight vector.
+    z_scores: Dict[str, float] = {}
+    for sym1 in valid_symbols:
+        w_sum = sum(
+            (1 - corr_matrix[sym1][sym2]) * (1 - weights[sym2])
+            for sym2 in valid_symbols
+            if sym1 != sym2
+        )
+        z_scores[sym1] = (1.0 / vol_divisor[sym1]) * w_sum
 
-    weights: Dict[str, float] = {
-        sym: (z / total_z) if total_z > 0 else (1 / num_assets)
-        for sym, z in z_scores.items()
-    }
-
+    # 5. Convert normalized weight to a per-trigger USD contribution.
+    #    Under equal weighting this reduces to exactly
+    #    BASE_TRIGGER_USD per symbol.
     contrib_per_trigger_usd: Dict[str, float] = {
         sym: BASE_TRIGGER_USD * num_assets * weights[sym]
-        for sym in symbols
+        for sym in valid_symbols
     }
+
+    # Any symbol in `symbols` that did not make it into
+    # `valid_symbols` (no fetched data at all) falls back to flat
+    # BASE_TRIGGER_USD individually, rather than being silently
+    # dropped from the cached contribution map.
+    for sym in symbols:
+        if sym not in contrib_per_trigger_usd:
+            log.warning(
+                f"[{sym}] excluded from iterative weighting (no "
+                "usable data) — falling back to flat "
+                f"${BASE_TRIGGER_USD:.2f} for this symbol today"
+            )
+            contrib_per_trigger_usd[sym] = BASE_TRIGGER_USD
 
     log.info(
         "contribution-weighting recompute complete: "
@@ -803,6 +1193,15 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
             f"{sym}=${contrib_per_trigger_usd[sym]:.3f}"
             for sym in symbols
         )
+    )
+
+    _write_contribution_overview_report(
+        valid_symbols, common_dates, corr_matrix, col_averages,
+        vol_data, z_scores, weights, contrib_per_trigger_usd
+    )
+    _build_contribution_svg_heatmap(
+        valid_symbols, corr_matrix, col_averages, vol_data,
+        z_scores, weights, contrib_per_trigger_usd
     )
 
     return contrib_per_trigger_usd
@@ -1012,7 +1411,7 @@ def recompute_contributions_if_due(today: datetime.date, force: bool = False):
     log.info(
         f"contribution-weighting recompute due "
         f"(last={last}, today={today}, force={force}) — running "
-        f"{CONTRIB_LOOKBACK_DAYS}-day analysis over "
+        f"iterative {CONTRIB_LOOKBACK_DAYS}-day analysis over "
         f"{len(SYMBOLS)} symbols"
     )
 
@@ -1020,9 +1419,9 @@ def recompute_contributions_if_due(today: datetime.date, force: bool = False):
 
     if result is None:
         log.error(
-            "contribution-weighting recompute FAILED (total outage) "
-            f"— falling back to flat ${BASE_TRIGGER_USD:.2f} for "
-            "every symbol today"
+            "contribution-weighting recompute FAILED (total outage "
+            "or insufficient aligned history) — falling back to "
+            f"flat ${BASE_TRIGGER_USD:.2f} for every symbol today"
         )
         result = {sym: BASE_TRIGGER_USD for sym in SYMBOLS}
 
@@ -1950,6 +2349,11 @@ def run_minute_checks(now_utc: datetime.datetime):
 # ── daily activity report ─────────────────────────────────────────────────────
 
 def build_daily_report_text(now_utc: datetime.datetime) -> str:
+    """Builds the plain-text daily activity report body. Iterates
+    every symbol currently configured in SYMBOLS — i.e. every
+    actively-monitored symbol, whether presently trading or flagged
+    FAILED — so the report always reflects the FULL active symbol
+    roster and never silently omits an entry."""
     window_start = None
 
     for sym in SYMBOLS:
@@ -1979,8 +2383,19 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
         else "Contribution weights: not yet computed (flat fallback in effect)"
     )
 
-    lines = [header, contrib_note, ""]
+    active_count = sum(1 for sym in SYMBOLS if not is_failed(sym))
+    failed_count_total = len(SYMBOLS) - active_count
 
+    roster_note = (
+        f"Symbols covered: {len(SYMBOLS)} total "
+        f"({active_count} trading, {failed_count_total} failed/excluded)"
+    )
+
+    lines = [header, contrib_note, roster_note, ""]
+
+    # Every symbol in SYMBOLS gets a line — active and failed alike —
+    # so the report always covers the full, current roster of
+    # actively-monitored symbols with no omissions.
     for sym in SYMBOLS:
         stats = get_daily_stats_snapshot(sym)
         triggers = stats["triggers"]
