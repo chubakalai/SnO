@@ -147,32 +147,28 @@ ORDER SIZING (per-trigger accumulator increment, USD)
 For NON-FAILED symbols, each trigger adds an order-size amount to
 the pending accumulator, computed as:
 
-    order_size_usd = 1 + (BudgetR / contribution) * 100
+    order_size_usd = contribution + BudgetR / 100
 
 where:
-  - BudgetR is this symbol's BudgetR value AFTER the BUDGET-R update
-    for this same trigger has already been applied (see BUDGET-R
-    above).
   - contribution is this symbol's CURRENT cached per-trigger
     contribution in USD, from the daily iterative weighting
     recompute (see CONTRIBUTION WEIGHTING below) — the SAME
-    pre-existing value that this formula's inputs are derived from,
-    not a new or separately-tracked figure.
+    pre-existing value used elsewhere, not a new or separately-
+    tracked figure.
+  - BudgetR is this symbol's BudgetR value AFTER the BUDGET-R
+    update for this same trigger has already been applied (see
+    BUDGET-R above).
 
-Standard arithmetic precedence applies: division and multiplication
-bind before addition, so this is 1 + ((BudgetR / contribution) *
-100), NOT 1 + (BudgetR / (contribution * 100)).
-
-DIVIDE-BY-ZERO GUARD: contribution is expected to always be
-strictly positive under the iterative weighting scheme, but a
-weight of exactly zero is not analytically excluded. If, at the
-moment this formula is evaluated, contribution is <= 0.0, the
-formula is NOT evaluated; order_size_usd falls back to
-TRIGGER_STACK_USD ($1.00) for that single trigger ONLY, and the
-event is logged clearly. This is a defensive guard against an
-unhandled exception taking down the per-minute check loop for every
-symbol, not an intended behavioural pathway, and should essentially
-never activate in practice.
+This is the fully reduced form of "(1 + BudgetR / (contribution *
+100)) * contribution": expanding that product algebraically cancels
+one power of contribution against the contribution*100 term in the
+denominator, leaving exactly contribution + BudgetR/100 with no
+division by contribution anywhere in the final expression. contrib-
+ution therefore never appears as a divisor in this formula, and no
+divide-by-zero guard is needed for it here. contribution's only
+role in the final formula is as an additive floor: when BudgetR is
+0, order_size_usd reduces to exactly contribution, matching the
+pre-scaling per-trigger baseline.
 
 This order_size_usd REPLACES the previous flat per-trigger
 contribution as the accumulator increment. The accumulator itself
@@ -608,17 +604,14 @@ BUDGET_DAILY_ACCRUAL_MULT = 10.0     # daily budget accrual = this * that
                                       # ACCRUAL in the module docstring).
                                       # Replaces the former flat
                                       # BUDGET_DAILY_ACCRUAL_USD ($10).
-TRIGGER_STACK_USD        = 1.0       # fallback flat $ used as order_size_usd
-                                      # if contribution is <= 0 at the moment
-                                      # the order-sizing formula would
-                                      # otherwise divide by it (see ORDER
-                                      # SIZING in the module docstring); also
-                                      # the default get_contrib_per_trigger_usd
+TRIGGER_STACK_USD        = 1.0       # default get_contrib_per_trigger_usd
                                       # returns for a symbol whose
                                       # contribution has never been computed.
 
-ORDER_SIZE_BASE_USD  = 1.0    # the leading "1 +" in the order-sizing formula
-ORDER_SIZE_SCALE     = 100.0  # the "* 100" in the order-sizing formula
+ORDER_SIZE_BUDGET_R_DIVISOR = 100.0  # order_size_usd = contribution +
+                                      # BudgetR / ORDER_SIZE_BUDGET_R_DIVISOR
+                                      # (see ORDER SIZING in the module
+                                      # docstring).
 
 ROLL_MINUTES_SHORT = 2 * 24 * 60     # 2 days, in minutes -> "2d low"
 ROLL_MINUTES_LONG  = 9 * 24 * 60     # 9 days, in minutes -> "9d low"
@@ -1513,6 +1506,8 @@ def _default_state() -> Dict:
         "last_report_sent_at": None,
         "contrib_per_trigger_usd": {},
         "contrib_last_computed_date": None,
+        "lifetime_orders_ok": {},
+        "lifetime_orders_failed": {},
     }
 
 
@@ -1740,41 +1735,31 @@ def recompute_contributions_if_due(today: datetime.date, force: bool = False):
 def compute_order_size_usd(sym: str, budget_r: float) -> float:
     """Computes the per-trigger accumulator increment (USD):
 
-        order_size_usd = 1 + (BudgetR / contribution) * 100
+        order_size_usd = contribution + BudgetR / 100
 
-    Standard arithmetic precedence: division and multiplication
-    bind before addition. contribution is this symbol's CURRENT
-    cached per-trigger contribution (the same pre-existing value
-    used elsewhere, not a new figure). See ORDER SIZING in the
-    module docstring.
+    This is the fully-reduced form of
+    "(1 + BudgetR/(contribution*100)) * contribution" — expanding
+    that product cancels one power of contribution against the
+    contribution*100 term in the denominator, leaving exactly
+    contribution + BudgetR/100 with no division by contribution
+    anywhere in the final expression. See ORDER SIZING in the
+    module docstring for the full derivation. contribution is this
+    symbol's CURRENT cached per-trigger contribution (the same
+    pre-existing value used elsewhere, not a new figure); BudgetR is
+    the value AFTER this trigger's BUDGET-R update has already been
+    applied.
 
-    Defensive guard: if contribution is <= 0.0 at evaluation time
-    (expected to essentially never happen under the iterative
-    weighting scheme, but not analytically impossible), the formula
-    is skipped and TRIGGER_STACK_USD is used instead for this one
-    trigger, to avoid an unhandled division-by-zero taking down the
-    per-minute check loop for every symbol.
+    contribution never appears as a divisor in this formula, so no
+    divide-by-zero guard is required here.
     """
     contribution = get_contrib_per_trigger_usd(sym)
 
-    if contribution <= 0.0:
-        log.error(
-            f"[{sym}] order-sizing formula skipped: contribution "
-            f"(${contribution:.4f}) is <= 0 — falling back to flat "
-            f"${TRIGGER_STACK_USD:.2f} for this trigger only "
-            "(this should essentially never happen; investigate the "
-            "contribution-weighting recompute if seen repeatedly)"
-        )
-        return TRIGGER_STACK_USD
-
-    order_size_usd = ORDER_SIZE_BASE_USD + (
-        (budget_r / contribution) * ORDER_SIZE_SCALE
-    )
+    order_size_usd = contribution + (budget_r / ORDER_SIZE_BUDGET_R_DIVISOR)
 
     log.info(
-        f"[{sym}] order-sizing: 1 + (BudgetR ${budget_r:.2f} / "
-        f"contribution ${contribution:.3f}) * 100 "
-        f"= ${order_size_usd:.2f}"
+        f"[{sym}] order-sizing: contribution ${contribution:.3f} + "
+        f"(BudgetR ${budget_r:.2f} / {ORDER_SIZE_BUDGET_R_DIVISOR:.0f}) "
+        f"= ${order_size_usd:.4f}"
     )
 
     return order_size_usd
@@ -1873,13 +1858,6 @@ def executed_orders_for_sym(sym: str) -> List[Dict]:
     ]
 
 
-def lifetime_failed_order_count(sym: str) -> int:
-    return sum(
-        int(STATE_DATA["daily_stats"].get(s, {}).get("orders_failed", 0))
-        for s in [sym]
-    ) + int(STATE_DATA.get("lifetime_orders_failed", {}).get(sym, 0))
-
-
 def record_lifetime_order_outcome(sym: str, success: bool):
     """Tracks LIFETIME (never-reset) executed/failed order counts
     per symbol, separate from the daily-stats counters (which reset
@@ -1888,14 +1866,13 @@ def record_lifetime_order_outcome(sym: str, success: bool):
     persistent history, not a rolling reporting window."""
     with _STATE_DATA_LOCK:
         key = "lifetime_orders_ok" if success else "lifetime_orders_failed"
-        STATE_DATA.setdefault(key, {})
         STATE_DATA[key][sym] = int(STATE_DATA[key].get(sym, 0)) + 1
         _persist()
 
 
 def get_lifetime_order_counts(sym: str) -> Tuple[int, int]:
-    ok = int(STATE_DATA.get("lifetime_orders_ok", {}).get(sym, 0))
-    failed = int(STATE_DATA.get("lifetime_orders_failed", {}).get(sym, 0))
+    ok = int(STATE_DATA["lifetime_orders_ok"].get(sym, 0))
+    failed = int(STATE_DATA["lifetime_orders_failed"].get(sym, 0))
     return ok, failed
 
 
@@ -2680,7 +2657,7 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
 
     log.info(
         f"[{sym}] TRIGGER — accumulator now ${pending:.2f} "
-        f"(order_size=${order_size_usd:.2f} added this trigger) "
+        f"(order_size=${order_size_usd:.4f} added this trigger) "
         f"@ price={candle_low:.4f}"
     )
 
@@ -2718,14 +2695,14 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
             log.warning(
                 f"[{sym}] fire skipped by place_long despite "
                 "passing pre-check — leaving accumulator intact "
-                f"(carries forward ${order_size_usd:.2f} from this "
+                f"(carries forward ${order_size_usd:.4f} from this "
                 "trigger)"
             )
         else:
             log.error(
                 f"[{sym}] minute-trigger order rejected by MEXC — "
                 "leaving accumulator intact, will retry on next "
-                f"trigger (carries forward ${order_size_usd:.2f} "
+                f"trigger (carries forward ${order_size_usd:.4f} "
                 "from this trigger)"
             )
         return
