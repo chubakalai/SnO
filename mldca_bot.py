@@ -20,8 +20,10 @@ MINUTE-TRIGGER ENGINE
 
 Per-symbol running budget:
   - Starts at $0.
-  - At every UTC midnight, a flat +$10 is added to the symbol's
-    running budget (accrual, not a fixed pool).
+  - At every UTC midnight, an accrual of (10 x that symbol's
+    CURRENT per-trigger contribution in USD) is added to the
+    symbol's running budget (accrual, not a fixed pool; NOT a flat
+    $10 — see BUDGET ACCRUAL below).
   - Every time a real order is placed for a symbol, its USD amount
     is subtracted from that symbol's running budget. The budget can
     go negative.
@@ -39,18 +41,25 @@ EVERY symbol, including FAILED ones — see FAILED SYMBOLS below):
      see STRICT NEW-LOW SEMANTICS below.
   3. If the closed candle's low is STRICTLY LESS THAN that
      reference low, it is a TRIGGER.
-  4. For NON-FAILED symbols only: a trigger adds that symbol's
-     CURRENT per-trigger contribution (see CONTRIBUTION WEIGHTING
-     below) to the pending accumulator, and if the accumulator's
-     contract-equivalent at the triggering candle's low is >= the
-     exchange's minimum order size, a real limit LONG is placed at
-     exactly that low price for the full accumulated amount; the
-     accumulator resets to 0 and the amount is subtracted from the
-     running budget.
+  4. For NON-FAILED symbols only: a trigger first updates BudgetR
+     (see BUDGET-R below), then adds an order-size amount (see
+     ORDER SIZING below) to the pending accumulator, and if the
+     accumulator's contract-equivalent at the triggering candle's
+     low is >= the exchange's minimum order size, a real limit LONG
+     is placed at exactly that low price for the full accumulated
+     amount. On a SUCCESSFUL placement, the accumulator resets to 0
+     and the placed amount is subtracted from the running budget.
+     On a FAILED placement (rejected by the exchange), the
+     accumulator is left untouched — i.e. it retains the order-size
+     amount that was just added for this trigger, so a failed
+     order's size is carried forward into the accumulation rather
+     than discarded (see FAILED-ORDER CARRY-FORWARD below).
   5. For FAILED symbols: the trigger is evaluated and recorded (so
      it can be marked on the chart) but NO budget accrual, NO
      accumulator, and NO order is ever attempted — see FAILED
-     SYMBOLS below.
+     SYMBOLS below. BudgetR IS still tracked for failed symbols
+     (see BUDGET-R below), for charting/diagnostic consistency,
+     even though it has no effect on trading for that symbol.
 
 Rolling 1-minute OHLC candle buffer (per symbol):
   - Seeded ONCE at startup with ~10 days of 1-minute history, for
@@ -89,6 +98,102 @@ This affects trigger evaluation only. It does not change how the
 reference low is displayed on charts (chart threshold lines still
 reflect the standard rolling low over the full window, current
 candle included, for visual continuity with the plotted candles).
+
+═══════════════════════════════════════════════════════════════════
+BUDGET-R (per-symbol reference budget for order sizing)
+═══════════════════════════════════════════════════════════════════
+
+BudgetR is a second, distinct per-symbol running figure (separate
+from the running budget described above) whose sole purpose is to
+feed the order-sizing formula (see ORDER SIZING below). It is
+tracked for EVERY symbol, failed or not, so that a symbol which is
+later un-flagged or inspected retains a consistent history.
+
+  - INITIALIZATION: on process startup, for every symbol that does
+    not already have a BudgetR value in persisted state (i.e. first
+    run, or a symbol newly added to SYMBOLS), BudgetR is initialized
+    to that symbol's running budget at that moment. An existing
+    BudgetR value from a prior run is never overwritten by this
+    startup step.
+  - UPDATE RULE: every time a symbol TRIGGERS (strict new-low
+    condition satisfied — see STRICT NEW-LOW SEMANTICS — for BOTH
+    failed and non-failed symbols), BudgetR is updated as follows,
+    BEFORE the order-sizing formula is evaluated for that same
+    trigger:
+      - Let previous_trigger_low be the candle low recorded at this
+        symbol's MOST RECENT PRIOR TRIGGER (i.e. the most recent
+        prior minute at which the strict new-low condition was
+        itself satisfied for this symbol — NOT merely the most
+        recently checked candle, which triggers every minute
+        regardless of outcome).
+      - If there is no previous_trigger_low on record yet (this is
+        the symbol's first-ever trigger), OR if
+        candle_low >= previous_trigger_low (this trigger's low did
+        NOT set a new trigger-low relative to the last trigger):
+            BudgetR[sym] <- budget[sym]   (reset to the LIVE running
+                                            budget at this moment)
+      - Otherwise (candle_low < previous_trigger_low, i.e. this
+        trigger IS itself a new low relative to the previous
+        trigger):
+            BudgetR[sym] is left unchanged.
+      - In either case, this trigger's candle_low is then recorded
+        as the new previous_trigger_low for the NEXT trigger's
+        comparison.
+
+═══════════════════════════════════════════════════════════════════
+ORDER SIZING (per-trigger accumulator increment, USD)
+═══════════════════════════════════════════════════════════════════
+
+For NON-FAILED symbols, each trigger adds an order-size amount to
+the pending accumulator, computed as:
+
+    order_size_usd = 1 + (BudgetR / contribution) * 100
+
+where:
+  - BudgetR is this symbol's BudgetR value AFTER the BUDGET-R update
+    for this same trigger has already been applied (see BUDGET-R
+    above).
+  - contribution is this symbol's CURRENT cached per-trigger
+    contribution in USD, from the daily iterative weighting
+    recompute (see CONTRIBUTION WEIGHTING below) — the SAME
+    pre-existing value that this formula's inputs are derived from,
+    not a new or separately-tracked figure.
+
+Standard arithmetic precedence applies: division and multiplication
+bind before addition, so this is 1 + ((BudgetR / contribution) *
+100), NOT 1 + (BudgetR / (contribution * 100)).
+
+DIVIDE-BY-ZERO GUARD: contribution is expected to always be
+strictly positive under the iterative weighting scheme, but a
+weight of exactly zero is not analytically excluded. If, at the
+moment this formula is evaluated, contribution is <= 0.0, the
+formula is NOT evaluated; order_size_usd falls back to
+TRIGGER_STACK_USD ($1.00) for that single trigger ONLY, and the
+event is logged clearly. This is a defensive guard against an
+unhandled exception taking down the per-minute check loop for every
+symbol, not an intended behavioural pathway, and should essentially
+never activate in practice.
+
+This order_size_usd REPLACES the previous flat per-trigger
+contribution as the accumulator increment. The accumulator itself
+continues to behave exactly as before: it accumulates across
+triggers, and a real order is only placed once its contract-
+equivalent at the triggering price clears the exchange minimum.
+
+═══════════════════════════════════════════════════════════════════
+FAILED-ORDER CARRY-FORWARD
+═══════════════════════════════════════════════════════════════════
+
+order_size_usd (see ORDER SIZING above) is added to the accumulator
+BEFORE a real order placement is attempted. If that placement then
+FAILS (rejected by the exchange, or any other placement failure),
+the accumulator is left exactly as it was after the addition — i.e.
+it is NOT reset to zero on failure, only on a SUCCESSFUL placement.
+This means a failed order's order_size_usd is automatically carried
+forward into the accumulation for the next trigger, rather than
+being discarded. No separate "re-add on failure" step exists or is
+needed; this falls directly out of the accumulator only ever being
+reset on the success path.
 
 ═══════════════════════════════════════════════════════════════════
 CONTRIBUTION WEIGHTING (per-symbol $ per trigger)
@@ -145,6 +250,10 @@ same daily cadence as the budget accrual) and cached in persisted
 state. Every minute-trigger check within that day uses the cached
 per-symbol value — the daily-history network fetch and the
 iterative solve are never done inside the per-minute hot path.
+Because the BUDGET ACCRUAL step (see below) now depends on this
+same cached contribution value, the daily recompute is run BEFORE
+the accrual check within each engine cycle, so accrual always uses
+that day's freshly computed figure rather than a stale one.
 
 Each recompute cycle also writes a plain-text overview report
 (OVERVIEW_FILENAME) and an SVG correlation/weighting heatmap
@@ -157,6 +266,27 @@ have usable date-aligned history), EVERY symbol falls back to flat
 BASE_TRIGGER_USD ($1.00) for that day, and recompute is retried at
 the next daily cycle. This is a pure fallback, not a cached carry-
 forward — a failed recompute does not reuse yesterday's values.
+
+═══════════════════════════════════════════════════════════════════
+BUDGET ACCRUAL
+═══════════════════════════════════════════════════════════════════
+
+At every UTC midnight (once per UTC calendar day, gated exactly as
+before via last_accrual_date), each symbol's running budget is
+credited with:
+
+    accrual_usd = 10.0 * contrib_per_trigger_usd(sym)
+
+using that symbol's CURRENT cached per-trigger contribution — i.e.
+the same value read by get_contrib_per_trigger_usd, which defaults
+to TRIGGER_STACK_USD ($1.00) for a symbol whose contribution has
+never yet been successfully computed. This means a brand-new symbol
+(or one for which the recompute has never once succeeded) accrues
+10 * $1.00 = $10.00 on that day, identical in magnitude to the
+former flat-$10 behavior, purely as a natural consequence of the
+existing default rather than as a separately-coded special case.
+This REPLACES the former flat BUDGET_DAILY_ACCRUAL_USD ($10.00)
+entirely; there is no longer a symbol-independent flat accrual.
 
 ═══════════════════════════════════════════════════════════════════
 VOLATILITY CAPPING (iterative weighting stability)
@@ -245,7 +375,8 @@ TRADING ONLY:
   - No budget accrual.
   - No accumulator, no order attempts, ever.
 
-It does NOT exclude the symbol from CHARTING:
+It does NOT exclude the symbol from CHARTING or from BudgetR
+tracking:
   - Its 1-minute buffer keeps refreshing every minute, same as any
     other symbol.
   - Its chart keeps rendering every minute, same as any other
@@ -258,6 +389,11 @@ It does NOT exclude the symbol from CHARTING:
     have order markers — the chart legend distinguishes trigger
     markers (small tick marks) from order markers (circles), and a
     failed symbol's chart will only ever show the former.
+  - Its BudgetR is still updated on every trigger exactly per the
+    BUDGET-R rule above, purely for diagnostic/charting consistency,
+    even though BudgetR has no effect on trading for a failed
+    symbol (which never computes an order_size_usd or touches an
+    accumulator).
 
 ═══════════════════════════════════════════════════════════════════
 CHARTS
@@ -283,6 +419,46 @@ Charts are re-rendered every minute, AFTER the minute-trigger
 trading logic runs, so chart rendering never delays order placement.
 Served at /chart/<SYMBOL>.svg and linked from the main overview page
 for every symbol, failed or not.
+
+═══════════════════════════════════════════════════════════════════
+MAIN OVERVIEW TABLE (/chart.svg)
+═══════════════════════════════════════════════════════════════════
+
+The main overview SVG (distinct from each symbol's own candlestick
+chart) renders a single bordered, monospaced, all-black tabular
+grid, one row per symbol, with a legend line above the grid mapping
+each abbreviated column header to its full name. Columns, in order:
+
+  Sym     Symbol code. A failed symbol has "[F]" appended directly
+          after its code (e.g. "BTC_USDT[F]") since a uniform black
+          color scheme no longer distinguishes failed symbols by
+          color the way the former red/blue/orange scheme did.
+  Trg     Total triggers recorded for this symbol (lifetime count
+          of triggers persisted for this symbol, independent of the
+          rolling chart-marker pruning window).
+  Ctb     Current per-trigger contribution in USD
+          (get_contrib_per_trigger_usd).
+  BudR    Current BudgetR value in USD for this symbol.
+  MOS     Minimum order size for this symbol, in contracts
+          (_mos(sym)).
+  Acc     Current accumulator value in USD.
+  AvgEnt  Average fill price across EXECUTED (successful) orders
+          only for this symbol (distinct from the daily-stats
+          avg_attempt_price, which averages over ALL attempts
+          including rejections) — "n/a" if this symbol has no
+          executed orders yet.
+  Exec    Count of executed (successful) real-order placements,
+          lifetime, for this symbol.
+  Fail    Count of failed (rejected) real-order placement attempts,
+          lifetime, for this symbol.
+  Exp     Total exposure: cumulative USD notional (unlevered) summed
+          across every executed order for this symbol, lifetime.
+
+All text is rendered in solid black (#000000). Gridlines and cell
+borders are drawn in a light gray for legibility without competing
+with the black text. The table height grows with the symbol count;
+width is fixed with column widths sized to comfortably fit the
+widest expected value per column.
 
 ═══════════════════════════════════════════════════════════════════
 DAILY ACTIVITY REPORT (ntfy)
@@ -426,10 +602,23 @@ LEVERAGE = 20
 
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_USD = 10.0      # added to running budget at every UTC midnight
-TRIGGER_STACK_USD        = 1.0       # fallback flat $ added per trigger if the
-                                      # contribution-weighting recompute has never
-                                      # succeeded for a symbol
+BUDGET_DAILY_ACCRUAL_MULT = 10.0     # daily budget accrual = this * that
+                                      # symbol's current per-trigger
+                                      # contribution in USD (see BUDGET
+                                      # ACCRUAL in the module docstring).
+                                      # Replaces the former flat
+                                      # BUDGET_DAILY_ACCRUAL_USD ($10).
+TRIGGER_STACK_USD        = 1.0       # fallback flat $ used as order_size_usd
+                                      # if contribution is <= 0 at the moment
+                                      # the order-sizing formula would
+                                      # otherwise divide by it (see ORDER
+                                      # SIZING in the module docstring); also
+                                      # the default get_contrib_per_trigger_usd
+                                      # returns for a symbol whose
+                                      # contribution has never been computed.
+
+ORDER_SIZE_BASE_USD  = 1.0    # the leading "1 +" in the order-sizing formula
+ORDER_SIZE_SCALE     = 100.0  # the "* 100" in the order-sizing formula
 
 ROLL_MINUTES_SHORT = 2 * 24 * 60     # 2 days, in minutes -> "2d low"
 ROLL_MINUTES_LONG  = 9 * 24 * 60     # 9 days, in minutes -> "9d low"
@@ -485,6 +674,43 @@ CHART_MARGIN_L = 60
 CHART_MARGIN_R = 20
 CHART_MARGIN_T = 40
 CHART_MARGIN_B = 40
+
+
+# ── overview table constants ────────────────────────────────────────────────────
+
+TABLE_COLUMNS: List[Tuple[str, str]] = [
+    # (abbreviation, full name) — order defines column order and the
+    # legend line above the grid.
+    ("Sym",    "Symbol"),
+    ("Trg",    "Total Triggers"),
+    ("Ctb",    "Contribution/Trigger (USD)"),
+    ("BudR",   "BudgetR (USD)"),
+    ("MOS",    "Min Order Size (contracts)"),
+    ("Acc",    "Accumulator (USD)"),
+    ("AvgEnt", "Average Entry Price"),
+    ("Exec",   "Executed Orders"),
+    ("Fail",   "Failed Orders"),
+    ("Exp",    "Total Exposure (USD)"),
+]
+
+TABLE_ROW_H       = 26
+TABLE_HEADER_H    = 26
+TABLE_LEGEND_H    = 34
+TABLE_TITLE_H     = 30
+TABLE_MARGIN      = 16
+TABLE_COL_W: Dict[str, int] = {
+    "Sym":    150,
+    "Trg":    60,
+    "Ctb":    90,
+    "BudR":   100,
+    "MOS":    100,
+    "Acc":    90,
+    "AvgEnt": 110,
+    "Exec":   70,
+    "Fail":   70,
+    "Exp":    110,
+}
+TABLE_W = TABLE_MARGIN * 2 + sum(TABLE_COL_W.values())
 
 
 # ── daily activity report / ntfy constants ────────────────────────────────────
@@ -1277,6 +1503,9 @@ def _default_state() -> Dict:
         "orders": [],
         "triggers": [],
         "budget": {},
+        "budget_r": {},
+        "last_trigger_low": {},
+        "trigger_count": {},
         "accumulator": {},
         "last_accrual_date": {},
         "last_seen_minute": {},
@@ -1329,8 +1558,35 @@ def get_budget(sym: str) -> float:
     return float(STATE_DATA["budget"].get(sym, 0.0))
 
 
-def get_accumulator(sym: str) -> float:
-    return float(STATE_DATA["accumulator"].get(sym, 0.0))
+def get_budget_r(sym: str) -> float:
+    return float(STATE_DATA["budget_r"].get(sym, 0.0))
+
+
+def init_budget_r_if_absent(sym: str):
+    """Initializes BudgetR to the symbol's current running budget,
+    but ONLY if this symbol has no BudgetR entry at all yet (first
+    run, or a symbol newly added to SYMBOLS). An existing BudgetR
+    value carried over from a prior run is never overwritten by
+    this step — see BUDGET-R in the module docstring."""
+    with _STATE_DATA_LOCK:
+        if sym in STATE_DATA["budget_r"]:
+            return
+        starting_value = float(STATE_DATA["budget"].get(sym, 0.0))
+        STATE_DATA["budget_r"][sym] = starting_value
+        _persist()
+        log.info(
+            f"[{sym}] BudgetR initialized to current budget: "
+            f"${starting_value:.2f}"
+        )
+
+
+def get_last_trigger_low(sym: str) -> Optional[float]:
+    v = STATE_DATA["last_trigger_low"].get(sym)
+    return float(v) if v is not None else None
+
+
+def get_trigger_count(sym: str) -> int:
+    return int(STATE_DATA["trigger_count"].get(sym, 0))
 
 
 def get_last_accrual_date(sym: str) -> Optional[datetime.date]:
@@ -1363,18 +1619,71 @@ def accrue_daily_budget_if_due(sym: str, today: datetime.date):
         if last == today:
             return
 
+        contrib = float(
+            STATE_DATA["contrib_per_trigger_usd"].get(sym, TRIGGER_STACK_USD)
+        )
+        accrual = BUDGET_DAILY_ACCRUAL_MULT * contrib
+
         prev_budget = get_budget(sym)
-        new_budget = prev_budget + BUDGET_DAILY_ACCRUAL_USD
+        new_budget = prev_budget + accrual
         STATE_DATA["budget"][sym] = new_budget
         STATE_DATA["last_accrual_date"][sym] = today.isoformat()
 
         _persist()
 
         log.info(
-            f"[{sym}] daily budget accrual: "
-            f"{prev_budget:.2f} + {BUDGET_DAILY_ACCRUAL_USD:.2f} "
+            f"[{sym}] daily budget accrual "
+            f"({BUDGET_DAILY_ACCRUAL_MULT:.1f} x contrib "
+            f"${contrib:.3f} = ${accrual:.3f}): "
+            f"{prev_budget:.2f} + {accrual:.2f} "
             f"= {new_budget:.2f}"
         )
+
+
+def update_budget_r_on_trigger(sym: str, candle_low: float) -> float:
+    """Applies the BUDGET-R update rule for a single trigger and
+    returns the resulting BudgetR value (post-update) for immediate
+    use in the order-sizing formula. See BUDGET-R in the module
+    docstring for the full rule. Also records this trigger's
+    candle_low as the new last_trigger_low for the NEXT trigger's
+    comparison, and increments this symbol's lifetime trigger
+    count."""
+    with _STATE_DATA_LOCK:
+        prev_low = get_last_trigger_low(sym)
+
+        is_new_trigger_low = (
+            prev_low is not None and candle_low < prev_low
+        )
+
+        if is_new_trigger_low:
+            new_budget_r = get_budget_r(sym)
+            log.info(
+                f"[{sym}] BudgetR unchanged (this trigger low "
+                f"{candle_low:.4f} < previous trigger low "
+                f"{prev_low:.4f}): BudgetR=${new_budget_r:.2f}"
+            )
+        else:
+            new_budget_r = get_budget(sym)
+            STATE_DATA["budget_r"][sym] = new_budget_r
+            reason = (
+                "no previous trigger on record"
+                if prev_low is None
+                else (
+                    f"this trigger low {candle_low:.4f} did not set "
+                    f"a new low vs previous trigger low {prev_low:.4f}"
+                )
+            )
+            log.info(
+                f"[{sym}] BudgetR reset to live budget ({reason}): "
+                f"BudgetR=${new_budget_r:.2f}"
+            )
+
+        STATE_DATA["last_trigger_low"][sym] = candle_low
+        STATE_DATA["trigger_count"][sym] = get_trigger_count(sym) + 1
+
+        _persist()
+
+        return new_budget_r
 
 
 # ── contribution-weighting cache accessors ────────────────────────────────────
@@ -1428,14 +1737,60 @@ def recompute_contributions_if_due(today: datetime.date, force: bool = False):
     set_contrib_per_trigger_usd(result, today)
 
 
-def add_trigger_dollar(sym: str) -> float:
+def compute_order_size_usd(sym: str, budget_r: float) -> float:
+    """Computes the per-trigger accumulator increment (USD):
+
+        order_size_usd = 1 + (BudgetR / contribution) * 100
+
+    Standard arithmetic precedence: division and multiplication
+    bind before addition. contribution is this symbol's CURRENT
+    cached per-trigger contribution (the same pre-existing value
+    used elsewhere, not a new figure). See ORDER SIZING in the
+    module docstring.
+
+    Defensive guard: if contribution is <= 0.0 at evaluation time
+    (expected to essentially never happen under the iterative
+    weighting scheme, but not analytically impossible), the formula
+    is skipped and TRIGGER_STACK_USD is used instead for this one
+    trigger, to avoid an unhandled division-by-zero taking down the
+    per-minute check loop for every symbol.
+    """
+    contribution = get_contrib_per_trigger_usd(sym)
+
+    if contribution <= 0.0:
+        log.error(
+            f"[{sym}] order-sizing formula skipped: contribution "
+            f"(${contribution:.4f}) is <= 0 — falling back to flat "
+            f"${TRIGGER_STACK_USD:.2f} for this trigger only "
+            "(this should essentially never happen; investigate the "
+            "contribution-weighting recompute if seen repeatedly)"
+        )
+        return TRIGGER_STACK_USD
+
+    order_size_usd = ORDER_SIZE_BASE_USD + (
+        (budget_r / contribution) * ORDER_SIZE_SCALE
+    )
+
+    log.info(
+        f"[{sym}] order-sizing: 1 + (BudgetR ${budget_r:.2f} / "
+        f"contribution ${contribution:.3f}) * 100 "
+        f"= ${order_size_usd:.2f}"
+    )
+
+    return order_size_usd
+
+
+def add_order_size_to_accumulator(sym: str, order_size_usd: float) -> float:
     with _STATE_DATA_LOCK:
-        prev = get_accumulator(sym)
-        contribution = get_contrib_per_trigger_usd(sym)
-        new = prev + contribution
+        prev = float(STATE_DATA["accumulator"].get(sym, 0.0))
+        new = prev + order_size_usd
         STATE_DATA["accumulator"][sym] = new
         _persist()
         return new
+
+
+def get_accumulator(sym: str) -> float:
+    return float(STATE_DATA["accumulator"].get(sym, 0.0))
 
 
 def reset_accumulator(sym: str):
@@ -1504,6 +1859,44 @@ def _safe_ts(iso_str: Optional[str]) -> Optional[float]:
 
 def total_orders_count() -> int:
     return len(STATE_DATA["orders"])
+
+
+def executed_orders_for_sym(sym: str) -> List[Dict]:
+    """Real (non-test) successfully-executed orders for this symbol,
+    i.e. those placed via the minute-trigger engine's success path,
+    identified by carrying a 'reference_window' key (mirrors the
+    same identification test used elsewhere, e.g. in chart order
+    markers and render_svg's fire count)."""
+    return [
+        o for o in STATE_DATA["orders"]
+        if o.get("symbol") == sym and "reference_window" in o
+    ]
+
+
+def lifetime_failed_order_count(sym: str) -> int:
+    return sum(
+        int(STATE_DATA["daily_stats"].get(s, {}).get("orders_failed", 0))
+        for s in [sym]
+    ) + int(STATE_DATA.get("lifetime_orders_failed", {}).get(sym, 0))
+
+
+def record_lifetime_order_outcome(sym: str, success: bool):
+    """Tracks LIFETIME (never-reset) executed/failed order counts
+    per symbol, separate from the daily-stats counters (which reset
+    on each successfully sent activity report) — needed because the
+    overview table's Exec/Fail columns are meant to reflect
+    persistent history, not a rolling reporting window."""
+    with _STATE_DATA_LOCK:
+        key = "lifetime_orders_ok" if success else "lifetime_orders_failed"
+        STATE_DATA.setdefault(key, {})
+        STATE_DATA[key][sym] = int(STATE_DATA[key].get(sym, 0)) + 1
+        _persist()
+
+
+def get_lifetime_order_counts(sym: str) -> Tuple[int, int]:
+    ok = int(STATE_DATA.get("lifetime_orders_ok", {}).get(sym, 0))
+    failed = int(STATE_DATA.get("lifetime_orders_failed", {}).get(sym, 0))
+    return ok, failed
 
 
 # ── daily stats (activity report counters) ────────────────────────────────────
@@ -2268,18 +2661,26 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     record_trigger_marker(sym, candle_dt, candle_low, ref_label)
     record_trigger_stat(sym)
 
+    # BudgetR is updated for EVERY trigger, failed symbols included,
+    # per the BUDGET-R rule — see module docstring. This must happen
+    # BEFORE the order-sizing formula is evaluated, since the
+    # formula consumes the POST-update BudgetR value.
+    budget_r_now = update_budget_r_on_trigger(sym, candle_low)
+
     if failed:
         log.info(
             f"[{sym}] TRIGGER (failed symbol, marker-only, "
-            f"no accumulation) @ price={candle_low:.4f}"
+            f"no accumulation) @ price={candle_low:.4f} "
+            f"BudgetR=${budget_r_now:.2f}"
         )
         return
 
-    pending = add_trigger_dollar(sym)
+    order_size_usd = compute_order_size_usd(sym, budget_r_now)
+    pending = add_order_size_to_accumulator(sym, order_size_usd)
 
     log.info(
         f"[{sym}] TRIGGER — accumulator now ${pending:.2f} "
-        f"(contribution=${get_contrib_per_trigger_usd(sym):.3f}/trigger) "
+        f"(order_size=${order_size_usd:.2f} added this trigger) "
         f"@ price={candle_low:.4f}"
     )
 
@@ -2307,20 +2708,30 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
 
     if oid == "SKIP" or oid is None:
         record_attempt_stat(sym, candle_low, success=False)
+        record_lifetime_order_outcome(sym, success=False)
+        # Accumulator is deliberately NOT reset here — it retains
+        # the order_size_usd that was just added above, so this
+        # failed attempt's amount carries forward into the next
+        # trigger's accumulation rather than being discarded. See
+        # FAILED-ORDER CARRY-FORWARD in the module docstring.
         if oid == "SKIP":
             log.warning(
                 f"[{sym}] fire skipped by place_long despite "
-                "passing pre-check — leaving accumulator intact"
+                "passing pre-check — leaving accumulator intact "
+                f"(carries forward ${order_size_usd:.2f} from this "
+                "trigger)"
             )
         else:
             log.error(
                 f"[{sym}] minute-trigger order rejected by MEXC — "
                 "leaving accumulator intact, will retry on next "
-                "trigger"
+                f"trigger (carries forward ${order_size_usd:.2f} "
+                "from this trigger)"
             )
         return
 
     record_attempt_stat(sym, candle_low, success=True, usd_if_success=pending)
+    record_lifetime_order_outcome(sym, success=True)
     reset_accumulator(sym)
     spend_budget(sym, pending)
 
@@ -2579,22 +2990,57 @@ def run_startup_test_orders():
     )
 
 
-# ── main overview SVG ─────────────────────────────────────────────────────────
+# ── main overview SVG (tabular) ────────────────────────────────────────────────
+
+def _table_col_x(col_key: str) -> int:
+    x = TABLE_MARGIN
+    for key, _full in TABLE_COLUMNS:
+        if key == col_key:
+            return x
+        x += TABLE_COL_W[key]
+    return x
+
+
+def _avg_entry_price(sym: str) -> Optional[float]:
+    orders = executed_orders_for_sym(sym)
+    if not orders:
+        return None
+    total = sum(float(o.get("limit_price", 0.0)) for o in orders)
+    return total / len(orders)
+
+
+def _total_exposure_usd(sym: str) -> float:
+    """Cumulative USD notional (unlevered) across every executed
+    order for this symbol, lifetime. Uses the 'usd' field recorded
+    on each real order (the accumulated amount actually submitted),
+    NOT multiplied by leverage."""
+    orders = executed_orders_for_sym(sym)
+    return sum(float(o.get("usd", 0.0)) for o in orders)
+
 
 def render_svg(now_utc: datetime.datetime) -> str:
-    W = 1200
-    H = 60 + 30 * len(SYMBOLS)
-
     now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     contrib_date = get_contrib_last_computed_date()
     contrib_date_str = (
         contrib_date.isoformat() if contrib_date is not None else "pending"
     )
 
+    n_rows = len(SYMBOLS)
+    table_h = (
+        TABLE_TITLE_H + TABLE_LEGEND_H + TABLE_HEADER_H
+        + n_rows * TABLE_ROW_H + TABLE_MARGIN
+    )
+    W = TABLE_W
+    H = table_h
+
     title_text = _xml_escape(
         f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
         f'minute-trigger engine — {now_str} — '
         f'contrib weights: {contrib_date_str}'
+    )
+
+    legend_text = _xml_escape(
+        "  ".join(f"{abbr}={full}" for abbr, full in TABLE_COLUMNS)
     )
 
     svg = [
@@ -2605,75 +3051,104 @@ def render_svg(now_utc: datetime.datetime) -> str:
             f'width="100%" '
             f'style="max-width:{W}px;display:block">'
         ),
-        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
+        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
         (
-            f'<text x="20" y="24" '
+            f'<text x="{TABLE_MARGIN}" y="20" '
             f'font-family="Courier New" '
             f'font-size="13" '
-            f'fill="#333" '
+            f'fill="#000000" '
             f'font-weight="bold">'
             f'{title_text}'
             f'</text>'
         ),
+        (
+            f'<text x="{TABLE_MARGIN}" y="{TABLE_TITLE_H + 16}" '
+            f'font-family="Courier New" '
+            f'font-size="9" '
+            f'fill="#000000">'
+            f'{legend_text}'
+            f'</text>'
+        ),
     ]
 
-    y = 50
+    grid_top = TABLE_TITLE_H + TABLE_LEGEND_H
+    header_y = grid_top + TABLE_HEADER_H - 8
 
-    for sym in SYMBOLS:
-        failed = is_failed(sym)
-        budget = get_budget(sym)
-        accum = get_accumulator(sym)
-        contrib = get_contrib_per_trigger_usd(sym)
+    # Header row
+    svg.append(
+        f'<rect x="{TABLE_MARGIN}" y="{grid_top}" '
+        f'width="{W - TABLE_MARGIN * 2}" height="{TABLE_HEADER_H}" '
+        f'fill="#f0f0f0" stroke="#999999" stroke-width="1"/>'
+    )
 
-        buf = MINUTE_BUFFERS[sym]
-        low2d = buf.rolling_low(ROLL_MINUTES_SHORT)
-        low9d = buf.rolling_low(ROLL_MINUTES_LONG)
-
-        low2d_str = f"{low2d:,.4f}" if low2d is not None else "n/a"
-        low9d_str = f"{low9d:,.4f}" if low9d is not None else "n/a"
-
-        ref = "2d" if budget >= 0 else "9d"
-
-        n_orders = sum(
-            1 for o in STATE_DATA["orders"]
-            if o.get("symbol") == sym and "reference_window" in o
+    for abbr, _full in TABLE_COLUMNS:
+        x = _table_col_x(abbr)
+        svg.append(
+            f'<text x="{x + 6}" y="{header_y}" '
+            f'font-family="Courier New" font-size="11" '
+            f'fill="#000000" font-weight="bold">'
+            f'{_xml_escape(abbr)}</text>'
         )
 
-        eff_lev = _effective_leverage(sym)
-
-        if failed:
-            clr = "#cc0000"
-            line = (
-                f"{sym:<18} "
-                "*** FAILED — EXCLUDED FROM TRADING "
-                "(chart & triggers still tracked) ***  "
-                f"2dLow={low2d_str:>12}  9dLow={low9d_str:>12}"
-            )
-        else:
-            clr = "#1155cc" if budget >= 0 else "#cc7a00"
-            line = (
-                f"{sym:<18} "
-                f"budget=${budget:>8,.2f}  "
-                f"accum=${accum:>5,.2f}  "
-                f"contrib=${contrib:>5,.3f}/trig  "
-                f"lev={eff_lev:>3}x  "
-                f"ref={ref}  "
-                f"2dLow={low2d_str:>12}  "
-                f"9dLow={low9d_str:>12}  "
-                f"fires={n_orders:>4}  "
-                f"buf={buf.size():>6}m"
-            )
+    # Body rows
+    for i, sym in enumerate(SYMBOLS):
+        row_y = grid_top + TABLE_HEADER_H + i * TABLE_ROW_H
+        text_y = row_y + TABLE_ROW_H - 8
 
         svg.append(
-            f'<text x="20" y="{y}" '
-            f'font-family="Courier New" '
-            f'font-size="11" '
-            f'fill="{clr}">'
-            f'{_xml_escape(line)}'
-            f'</text>'
+            f'<rect x="{TABLE_MARGIN}" y="{row_y}" '
+            f'width="{W - TABLE_MARGIN * 2}" height="{TABLE_ROW_H}" '
+            f'fill="#ffffff" stroke="#dddddd" stroke-width="1"/>'
         )
 
-        y += 30
+        failed = is_failed(sym)
+        trg = get_trigger_count(sym)
+        ctb = get_contrib_per_trigger_usd(sym)
+        bud_r = get_budget_r(sym)
+        mos = _mos(sym)
+        acc = get_accumulator(sym)
+        avg_entry = _avg_entry_price(sym)
+        exec_ok, exec_failed = get_lifetime_order_counts(sym)
+        exposure = _total_exposure_usd(sym)
+
+        sym_display = f"{sym}[F]" if failed else sym
+
+        values = {
+            "Sym":    sym_display,
+            "Trg":    f"{trg}",
+            "Ctb":    f"{ctb:,.3f}",
+            "BudR":   f"{bud_r:,.2f}",
+            "MOS":    f"{mos:,.4f}",
+            "Acc":    f"{acc:,.2f}",
+            "AvgEnt": (f"{avg_entry:,.4f}" if avg_entry is not None else "n/a"),
+            "Exec":   f"{exec_ok}",
+            "Fail":   f"{exec_failed}",
+            "Exp":    f"{exposure:,.2f}",
+        }
+
+        for abbr, _full in TABLE_COLUMNS:
+            x = _table_col_x(abbr)
+            svg.append(
+                f'<text x="{x + 6}" y="{text_y}" '
+                f'font-family="Courier New" font-size="10" '
+                f'fill="#000000">'
+                f'{_xml_escape(values[abbr])}</text>'
+            )
+
+    # Column separators
+    x = TABLE_MARGIN
+    for abbr, _full in TABLE_COLUMNS:
+        svg.append(
+            f'<line x1="{x}" y1="{grid_top}" '
+            f'x2="{x}" y2="{grid_top + TABLE_HEADER_H + n_rows * TABLE_ROW_H}" '
+            f'stroke="#cccccc" stroke-width="1"/>'
+        )
+        x += TABLE_COL_W[abbr]
+    svg.append(
+        f'<line x1="{x}" y1="{grid_top}" '
+        f'x2="{x}" y2="{grid_top + TABLE_HEADER_H + n_rows * TABLE_ROW_H}" '
+        f'stroke="#999999" stroke-width="1"/>'
+    )
 
     svg.append("</svg>")
     return "\n".join(svg)
@@ -2984,6 +3459,16 @@ def run_engine():
             exc_info=True
         )
 
+    log.info("initializing BudgetR for any symbol without existing state")
+    for sym in SYMBOLS:
+        try:
+            init_budget_r_if_absent(sym)
+        except Exception as e:
+            log.error(
+                f"[{sym}] BudgetR initialization failed: {e}",
+                exc_info=True
+            )
+
     run_startup_test_orders()
 
     log.info(
@@ -3084,6 +3569,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(
                 {
                     "budget": STATE_DATA["budget"],
+                    "budget_r": STATE_DATA["budget_r"],
                     "accumulator": STATE_DATA["accumulator"],
                     "contrib_per_trigger_usd": STATE_DATA["contrib_per_trigger_usd"],
                     "contrib_last_computed_date": STATE_DATA["contrib_last_computed_date"],
