@@ -608,7 +608,7 @@ TRIGGER_STACK_USD        = 1.0       # default get_contrib_per_trigger_usd
                                       # returns for a symbol whose
                                       # contribution has never been computed.
 
-ORDER_SIZE_BUDGET_R_DIVISOR = 100.0  # order_size_usd = contribution +
+ORDER_SIZE_BUDGET_R_DIVISOR = 1000.0  # order_size_usd = contribution +
                                       # BudgetR / ORDER_SIZE_BUDGET_R_DIVISOR
                                       # (see ORDER SIZING in the module
                                       # docstring).
