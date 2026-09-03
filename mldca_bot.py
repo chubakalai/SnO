@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MultiLongDCA-Bot — Multi-Symbol Minute-Trigger DCA Long Bot.
+MLowDCA — Execution and Monitoring: Multi-Symbol Minute-Trigger DCA
+Long Bot.
 
 Every symbol is priced and sized independently. Instead of firing
 once a day at a fixed daily slice, this engine checks EVERY MINUTE
@@ -437,30 +438,64 @@ MAIN OVERVIEW TABLE (/  — native HTML)
 
 The main overview table (distinct from each symbol's own SVG
 candlestick chart) is rendered as a native HTML <table> directly in
-the "/" page — NOT as SVG. A hand-built SVG grid of <rect>/<text>
-elements is disproportionate machinery for what is fundamentally
-tabular text: it requires manually computed cell coordinates, has
-no native text wrapping, and cannot be styled or reflowed by the
-browser the way an HTML table can. The status line formerly
-duplicated inside the SVG's own title text AND separately above it
-in the page body is now shown exactly ONCE, immediately above the
-table.
+the "/" page — NOT as SVG. The page's top section is deliberately
+minimal and non-repetitive:
 
-One row per symbol, with a legend line above the grid mapping each
-abbreviated column header to its full name. Columns, in order:
+  1. The page <h3> title: "MLowDCA — Execution and Monitoring".
+  2. EXACTLY ONE status line, sourced from STATE.get_status() (the
+     same string the engine cycle itself maintains — no separate,
+     independently-timed recomputation of the same figures exists
+     anywhere else on the page): "status: ok  <UTC timestamp>
+     total_orders=<n>  failed_symbols=<n>".
+  3. The table itself, one row per symbol, with a final <tfoot>
+     "Totals" row summing the columns that are meaningfully
+     additive across symbols (Trg, Exec, Fail, Exp — see the
+     per-column notes below for why the remaining columns are left
+     blank in that row rather than aggregated).
+  4. The column-abbreviation legend, moved BELOW the table and
+     rendered as light-gray subtext, exactly as before in content
+     but now visually subordinate to the table rather than
+     competing with it for attention at the top of the page.
+
+This deliberately eliminates the redundancy an earlier revision
+still had: that revision showed the engine's status line via
+STATE.get_status() AND a second, separately-built summary line
+(carrying an independently-computed request-time timestamp) that
+duplicated the same total_orders/failed_symbols figures under
+different wording. Because the two were computed at different
+moments (one on the last completed engine cycle, one at page-
+request time), their timestamps could visibly disagree even though
+the underlying counts had not changed — exactly the artifact
+reported against the prior revision. There is now exactly one
+status computation on the page.
+
+A hand-built SVG grid of <rect>/<text> elements is disproportionate
+machinery for what is fundamentally tabular text: it requires
+manually computed cell coordinates, has no native text wrapping,
+and cannot be styled or reflowed by the browser the way an HTML
+table can.
+
+One row per symbol, with the legend (see point 4 above) mapping
+each abbreviated column header to its full name. Columns, in order:
 
   Sym     Symbol code. A failed symbol has "[F]" appended directly
           after its code (e.g. "BTC_USDT[F]") since a uniform black
           color scheme no longer distinguishes failed symbols by
-          color the way the former red/blue/orange scheme did.
+          color the way the former red/blue/orange scheme did. In
+          the Totals row, this cell reads "Totals" instead of a
+          symbol code.
   Trg     Total triggers recorded for this symbol (lifetime count
           of triggers persisted for this symbol, independent of the
-          rolling chart-marker pruning window).
+          rolling chart-marker pruning window). SUMMED in Totals.
   Ctb     Current per-trigger contribution in USD
-          (get_contrib_per_trigger_usd).
+          (get_contrib_per_trigger_usd). NOT summed in Totals — a
+          summed per-trigger USD rate across heterogeneous symbols
+          has no coherent interpretation; left blank.
   BudR    Current BudgetR value in USD for this symbol. Always
           USD-denominated (see BUDGET-R above) — never a contract
-          count.
+          count. NOT summed in Totals for the same reason as Ctb
+          (a running per-symbol reference figure, not a portfolio
+          quantity); left blank.
   MOS     Minimum order size for this symbol, in USD
           (_mos_usd_from_buffer(sym)) — NOT in contracts. Every
           configured symbol's exchange-reported minimum order
@@ -481,26 +516,40 @@ abbreviated column header to its full name. Columns, in order:
           table issues zero extra network calls. "n/a" is shown if
           the buffer has no closed candle yet (e.g. immediately at
           startup, before seeding completes) or if this symbol has
-          no loaded contract spec.
-  Acc     Current accumulator value in USD.
+          no loaded contract spec. NOT summed in Totals — a summed
+          minimum-order-size threshold across symbols is not a
+          meaningful portfolio figure; left blank.
+  Acc     Current accumulator value in USD. NOT summed in Totals —
+          this is a per-symbol pending-order figure rather than a
+          realized portfolio quantity, and summing it would read as
+          "total money about to be spent," which is not what the
+          Totals row is for; left blank. (If a running total of
+          pending accumulation is wanted, it can be added as an
+          explicit, separately-labeled figure on request.)
   AvgEnt  Average fill price across EXECUTED (successful) orders
           only for this symbol (distinct from the daily-stats
           avg_attempt_price, which averages over ALL attempts
           including rejections) — "n/a" if this symbol has no
-          executed orders yet.
+          executed orders yet. NOT summed (or averaged) in Totals —
+          an unweighted average-of-averages across symbols at wildly
+          different price scales (e.g. XRP at ~$1.36 vs. BTC at
+          ~$77,738) would not be a meaningful "portfolio average
+          price"; left blank.
   Exec    Count of executed (successful) real-order placements,
-          lifetime, for this symbol.
+          lifetime, for this symbol. SUMMED in Totals.
   Fail    Count of failed (rejected) real-order placement attempts,
-          lifetime, for this symbol.
+          lifetime, for this symbol. SUMMED in Totals.
   Exp     Total exposure: cumulative USD notional (unlevered) summed
           across every executed order for this symbol, lifetime.
+          SUMMED in Totals — this is the portfolio-wide unlevered
+          USD notional across every symbol, lifetime.
 
-All cell values are HTML-escaped before insertion. The former
-TABLE_* SVG layout constants (pixel widths, row heights, margins)
-and the _table_col_x/render_svg coordinate-computation helpers no
-longer exist; column order and header labels are still driven by
-the same TABLE_COLUMNS list, now consumed by an HTML-table builder
-instead of an SVG one.
+All cell values are HTML-escaped. The former TABLE_* SVG layout
+constants (pixel widths, row heights, margins) and the
+_table_col_x/render_svg coordinate-computation helpers do not
+exist; column order and header labels are still driven by the same
+TABLE_COLUMNS list, now consumed by an HTML-table builder instead
+of an SVG one.
 
 ═══════════════════════════════════════════════════════════════════
 DAILY ACTIVITY REPORT (ntfy)
@@ -613,6 +662,8 @@ MEXC_KEY    = os.getenv("MEXC")
 MEXC_SECRET = os.getenv("MEXCSECRET")
 MEXC_BASE   = "https://api.mexc.co"
 
+PAGE_TITLE = "MLowDCA — Execution and Monitoring"
+
 
 # ── symbol configuration ──────────────────────────────────────────────────────
 
@@ -719,16 +770,23 @@ CHART_MARGIN_B = 40
 
 # ── overview table constants ────────────────────────────────────────────────────
 #
-# The overview table is now a native HTML <table> (see MAIN OVERVIEW
+# The overview table is a native HTML <table> (see MAIN OVERVIEW
 # TABLE in the module docstring) rather than hand-laid-out SVG, so
-# the pixel-geometry constants (row heights, column pixel widths,
-# margins) that this section formerly held no longer apply — column
-# order and header labels are still driven by TABLE_COLUMNS, now
-# consumed by an HTML-table builder instead of an SVG one.
+# pixel-geometry constants (row heights, column pixel widths,
+# margins) do not apply here — column order and header labels are
+# driven by TABLE_COLUMNS, consumed by an HTML-table builder.
+#
+# TOTALS_COLUMNS marks which columns are meaningfully additive
+# across symbols and therefore populated in the <tfoot> "Totals"
+# row; every column NOT listed here is left blank in that row
+# rather than aggregated in a way that would not have a coherent
+# portfolio-level interpretation (see the per-column notes in the
+# MAIN OVERVIEW TABLE docstring section for the reasoning behind
+# each inclusion/exclusion).
 
 TABLE_COLUMNS: List[Tuple[str, str]] = [
     # (abbreviation, full name) — order defines column order and the
-    # legend line above the grid.
+    # legend line below the grid.
     ("Sym",    "Symbol"),
     ("Trg",    "Total Triggers"),
     ("Ctb",    "Contribution/Trigger (USD)"),
@@ -740,6 +798,8 @@ TABLE_COLUMNS: List[Tuple[str, str]] = [
     ("Fail",   "Failed Orders"),
     ("Exp",    "Total Exposure (USD)"),
 ]
+
+TOTALS_COLUMNS = {"Trg", "Exec", "Fail", "Exp"}
 
 
 # ── daily activity report / ntfy constants ────────────────────────────────────
@@ -1883,7 +1943,7 @@ def executed_orders_for_sym(sym: str) -> List[Dict]:
     i.e. those placed via the minute-trigger engine's success path,
     identified by carrying a 'reference_window' key (mirrors the
     same identification test used elsewhere, e.g. in chart order
-    markers and render_svg's fire count)."""
+    markers)."""
     return [
         o for o in STATE_DATA["orders"]
         if o.get("symbol") == sym and "reference_window" in o
@@ -3060,51 +3120,36 @@ def _total_exposure_usd(sym: str) -> float:
     return sum(float(o.get("usd", 0.0)) for o in orders)
 
 
-def _overview_status_line(now_utc: datetime.datetime) -> str:
-    """Builds the single status line shown once above the overview
-    table. Formerly this same information (timestamp, symbol count,
-    contrib-recompute date, order/failed totals) was split across
-    two near-duplicate strings — one baked into the SVG's own title
-    text, one rendered separately in the HTML body above it. Now
-    that the table itself is native HTML rather than SVG, there is
-    exactly one place for this line to live."""
-    contrib_date = get_contrib_last_computed_date()
-    contrib_date_str = (
-        contrib_date.isoformat() if contrib_date is not None else "pending"
-    )
-    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-    n_orders = total_orders_count()
-    n_failed = len(FAILED_SYMBOLS)
-
-    return (
-        f"MultiLongDCA-Bot — {len(SYMBOLS)} symbols — "
-        f"minute-trigger engine — {now_str} — "
-        f"contrib weights: {contrib_date_str} — "
-        f"total_orders={n_orders} — failed_symbols={n_failed}"
-    )
-
-
 def render_overview_table_html(now_utc: datetime.datetime) -> str:
     """Builds the main overview table as a native HTML <table>
-    string — see MAIN OVERVIEW TABLE in the module docstring for why
-    this replaced the former hand-drawn SVG grid. Every value here
-    matches what the SVG version showed, with MOS now converted to
-    USD via _mos_usd_from_buffer instead of a bare contract count.
-    All cell text is HTML-escaped."""
+    string, plus the light-gray legend subtext placed BELOW it — see
+    MAIN OVERVIEW TABLE in the module docstring. The page's single
+    status line (engine status, sourced only from STATE.get_status())
+    is rendered by the caller in Handler.do_GET, not here, so this
+    function owns exactly the table and the legend beneath it — no
+    second, independently-timed status computation exists in this
+    function or anywhere else on the page.
+
+    Column values mirror the ones shown per-symbol, with MOS
+    converted to USD via _mos_usd_from_buffer instead of a bare
+    contract count. A final <tfoot> row sums the columns listed in
+    TOTALS_COLUMNS (Trg, Exec, Fail, Exp); every other column is
+    left blank in that row rather than aggregated in a way that
+    would not have a coherent portfolio-level meaning (see the
+    per-column notes in the MAIN OVERVIEW TABLE docstring section).
+    All cell text is HTML-escaped.
+    """
     legend = "  ".join(f"{abbr}={full}" for abbr, full in TABLE_COLUMNS)
 
-    parts = [
-        f'<p class="status">{_html_escape(_overview_status_line(now_utc))}</p>',
-        f'<p class="legend">{_html_escape(legend)}</p>',
-        '<table class="overview">',
-        '<thead><tr>',
-    ]
+    parts = ['<table class="overview">', '<thead><tr>']
 
     for abbr, _full in TABLE_COLUMNS:
         parts.append(f'<th>{_html_escape(abbr)}</th>')
 
     parts.append('</tr></thead>')
     parts.append('<tbody>')
+
+    totals = {"Trg": 0, "Exec": 0, "Fail": 0, "Exp": 0.0}
 
     for sym in SYMBOLS:
         failed = is_failed(sym)
@@ -3116,6 +3161,11 @@ def render_overview_table_html(now_utc: datetime.datetime) -> str:
         avg_entry = _avg_entry_price(sym)
         exec_ok, exec_failed = get_lifetime_order_counts(sym)
         exposure = _total_exposure_usd(sym)
+
+        totals["Trg"] += trg
+        totals["Exec"] += exec_ok
+        totals["Fail"] += exec_failed
+        totals["Exp"] += exposure
 
         sym_display = f"{sym}[F]" if failed else sym
 
@@ -3138,7 +3188,25 @@ def render_overview_table_html(now_utc: datetime.datetime) -> str:
             parts.append(f'<td>{_html_escape(values[abbr])}</td>')
         parts.append('</tr>')
 
-    parts.append('</tbody></table>')
+    parts.append('</tbody>')
+
+    # Totals footer row: populated only for columns in
+    # TOTALS_COLUMNS; every other column is left blank.
+    parts.append('<tfoot><tr>')
+    for abbr, _full in TABLE_COLUMNS:
+        if abbr == "Sym":
+            parts.append('<td>Totals</td>')
+        elif abbr == "Exp":
+            parts.append(f'<td>{totals["Exp"]:,.2f}</td>')
+        elif abbr in TOTALS_COLUMNS:
+            parts.append(f'<td>{totals[abbr]}</td>')
+        else:
+            parts.append('<td></td>')
+    parts.append('</tr></tfoot>')
+
+    parts.append('</table>')
+    parts.append(f'<p class="legend">{_html_escape(legend)}</p>')
+
     return "\n".join(parts)
 
 
@@ -3421,6 +3489,11 @@ def engine_cycle():
     n_orders = total_orders_count()
     n_failed = len(FAILED_SYMBOLS)
 
+    # This is the ONLY status computation in the entire bot — the
+    # page's status line (Handler.do_GET, "/") reads this same
+    # string via STATE.get_status() rather than recomputing an
+    # independently-timed second copy of the same figures. See MAIN
+    # OVERVIEW TABLE in the module docstring for why that matters.
     STATE.set_status(
         f"ok  "
         f"{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}  "
@@ -3595,6 +3668,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif self.path in ("/", ""):
             now_utc = datetime.datetime.now(UTC)
+
+            # Exactly one status computation on the whole page — the
+            # same string the engine cycle itself maintains. No
+            # second, request-time recomputation of total_orders /
+            # failed_symbols / timestamp exists anywhere else here.
             status = STATE.get_status()
             table_html = render_overview_table_html(now_utc)
 
@@ -3613,16 +3691,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "<head>"
                 "<meta charset='utf-8'>"
                 "<meta http-equiv='refresh' content='60'>"
-                "<title>MultiLongDCA-Bot Overview</title>"
+                f"<title>{_html_escape(PAGE_TITLE)}</title>"
                 "<style>"
                 "body{font-family:monospace;"
                 "background:#fafafa;margin:24px;color:#000}"
                 "img{max-width:100%;height:auto;"
                 "border:1px solid #ccc}"
-                "p.status{font-weight:bold;margin-bottom:4px}"
-                "p.legend{font-size:12px;color:#333;margin-top:0}"
+                "p.status{font-weight:bold;margin:4px 0 16px 0}"
+                "p.legend{font-size:11px;color:#999;"
+                "margin:6px 0 16px 0}"
                 "table.overview{border-collapse:collapse;"
-                "margin:8px 0 16px 0}"
+                "margin:0 0 4px 0}"
                 "table.overview th,table.overview td{"
                 "border:1px solid #ccc;padding:4px 8px;"
                 "text-align:right;white-space:nowrap}"
@@ -3631,14 +3710,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "table.overview td:first-child,"
                 "table.overview th:first-child{text-align:left}"
                 "table.overview tr.failed td:first-child{color:#cc0000}"
+                "table.overview tfoot td{font-weight:bold;"
+                "border-top:2px solid #999;background:#f7f7f7}"
                 "</style>"
                 "</head>"
                 "<body>"
-                "<h3>"
-                "MultiLongDCA-Bot — "
-                "Multi-Symbol Minute-Trigger DCA Long Bot"
-                "</h3>"
-                f"<p>engine status: {_html_escape(status)}</p>"
+                f"<h3>{_html_escape(PAGE_TITLE)}</h3>"
+                f"<p class='status'>status: {_html_escape(status)}</p>"
                 f"{table_html}"
                 f"<p>charts: {chart_links}</p>"
                 "<p>"
