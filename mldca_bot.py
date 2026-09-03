@@ -1,6 +1,536 @@
 #!/usr/bin/env python3
 """
 MultiLongDCA-Bot — Multi-Symbol Minute-Trigger DCA Long Bot.
+
+Every symbol is priced and sized independently. Instead of firing
+once a day at a fixed daily slice, this engine checks EVERY MINUTE
+(at :01 past the minute) whether the most recently closed 1-minute
+candle's low is a new rolling low over a reference window, and if
+so stacks a per-symbol trigger contribution toward that symbol's
+pending order.
+
+Single-process, single-machine bot for Fly.io.
+
+Symbols are configured in one place — SYMBOLS, near the top of this
+file. To add or remove a symbol, only edit SYMBOLS.
+
+═══════════════════════════════════════════════════════════════════
+MINUTE-TRIGGER ENGINE
+═══════════════════════════════════════════════════════════════════
+
+Per-symbol running budget:
+  - Starts at $0.
+  - At every UTC midnight, an accrual of (10 x that symbol's
+    CURRENT per-trigger contribution in USD) is added to the
+    symbol's running budget (accrual, not a fixed pool; NOT a flat
+    $10 — see BUDGET ACCRUAL below).
+  - Every time a real order is placed for a symbol, its USD amount
+    is subtracted from that symbol's running budget. The budget can
+    go negative.
+
+Per-minute check (runs once per minute, at :01 past the minute, for
+EVERY symbol, including FAILED ones — see FAILED SYMBOLS below):
+  1. Look at the most recently CLOSED 1-minute candle.
+  2. Choose the reference window based on the symbol's CURRENT
+     running budget at the moment of the check:
+       - budget >= 0  -> reference is the rolling 2-day low
+       - budget <  0  -> reference is the rolling 9-day low
+     Both are computed from the trailing window of closed 1-minute
+     candles (2 days = 2880 minutes, 9 days = 12960 minutes),
+     EXCLUDING the current (most recently closed) candle itself —
+     see STRICT NEW-LOW SEMANTICS below.
+  3. If the closed candle's low is STRICTLY LESS THAN that
+     reference low, it is a TRIGGER.
+  4. For NON-FAILED symbols only: a trigger first updates BudgetR
+     (see BUDGET-R below), then adds an order-size amount (see
+     ORDER SIZING below) to the pending accumulator, and if the
+     accumulator's contract-equivalent at the triggering candle's
+     low is >= the exchange's minimum order size, a real limit LONG
+     is placed at exactly that low price for the full accumulated
+     amount. On a SUCCESSFUL placement, the accumulator resets to 0
+     and the placed amount is subtracted from the running budget.
+     On a FAILED placement (rejected by the exchange), the
+     accumulator is left untouched — i.e. it retains the order-size
+     amount that was just added for this trigger, so a failed
+     order's size is carried forward into the accumulation rather
+     than discarded (see FAILED-ORDER CARRY-FORWARD below).
+  5. For FAILED symbols: the trigger is evaluated and recorded (so
+     it can be marked on the chart) but NO budget accrual, NO
+     accumulator, and NO order is ever attempted — see FAILED
+     SYMBOLS below. BudgetR IS still tracked for failed symbols
+     (see BUDGET-R below), for charting/diagnostic consistency,
+     even though it has no effect on trading for that symbol.
+
+Rolling 1-minute OHLC candle buffer (per symbol):
+  - Seeded ONCE at startup with ~10 days of 1-minute history, for
+    EVERY symbol including failed ones (so their charts have data).
+  - Updated every minute by fetching only the most recently closed
+    candle(s) and appending them, for every symbol regardless of
+    failed status.
+  - Powers both the trigger-reference lows AND the 15m-resampled
+    10-day chart (see CHARTS below).
+
+═══════════════════════════════════════════════════════════════════
+STRICT NEW-LOW SEMANTICS
+═══════════════════════════════════════════════════════════════════
+
+A trigger requires the most recently closed candle's low to be a
+genuine new low relative to the rest of the reference window — that
+is, STRICTLY LOWER than every OTHER candle's low in that window —
+rather than merely being less-than-or-equal-to the window minimum
+(which, since the current candle is itself a member of that window,
+would be trivially satisfied whenever the current candle ties or
+sets the minimum, including tying itself).
+
+To enforce this:
+  - The reference low (2d or 9d, per the budget-sign rule above) is
+    computed over the window EXCLUDING the current candle, via
+    rolling_low(..., exclude_latest=True).
+  - The trigger condition uses strict inequality:
+        triggered = candle_low < ref_low
+    rather than <=.
+  - If, after excluding the current candle, no other candles remain
+    in the window (e.g. very early in the buffer's life), there is
+    no prior low to compare against and the check is skipped for
+    that minute, exactly as when the buffer has no data at all.
+
+This affects trigger evaluation only. It does not change how the
+reference low is displayed on charts (chart threshold lines still
+reflect the standard rolling low over the full window, current
+candle included, for visual continuity with the plotted candles).
+
+═══════════════════════════════════════════════════════════════════
+BUDGET-R (per-symbol reference budget for order sizing)
+═══════════════════════════════════════════════════════════════════
+
+BudgetR is a second, distinct per-symbol running figure (separate
+from the running budget described above) whose sole purpose is to
+feed the order-sizing formula (see ORDER SIZING below). It is
+tracked for EVERY symbol, failed or not, so that a symbol which is
+later un-flagged or inspected retains a consistent history.
+
+  - INITIALIZATION: on process startup, for every symbol that does
+    not already have a BudgetR value in persisted state (i.e. first
+    run, or a symbol newly added to SYMBOLS), BudgetR is initialized
+    to that symbol's running budget at that moment. An existing
+    BudgetR value from a prior run is never overwritten by this
+    startup step.
+  - UPDATE RULE: every time a symbol TRIGGERS (strict new-low
+    condition satisfied — see STRICT NEW-LOW SEMANTICS — for BOTH
+    failed and non-failed symbols), BudgetR is updated as follows,
+    BEFORE the order-sizing formula is evaluated for that same
+    trigger:
+      - Let previous_trigger_low be the candle low recorded at this
+        symbol's MOST RECENT PRIOR TRIGGER (i.e. the most recent
+        prior minute at which the strict new-low condition was
+        itself satisfied for this symbol — NOT merely the most
+        recently checked candle, which triggers every minute
+        regardless of outcome).
+      - If there is no previous_trigger_low on record yet (this is
+        the symbol's first-ever trigger), OR if
+        candle_low >= previous_trigger_low (this trigger's low did
+        NOT set a new trigger-low relative to the last trigger):
+            BudgetR[sym] <- budget[sym]   (reset to the LIVE running
+                                            budget at this moment)
+      - Otherwise (candle_low < previous_trigger_low, i.e. this
+        trigger IS itself a new low relative to the previous
+        trigger):
+            BudgetR[sym] is left unchanged.
+      - In either case, this trigger's candle_low is then recorded
+        as the new previous_trigger_low for the NEXT trigger's
+        comparison.
+
+═══════════════════════════════════════════════════════════════════
+ORDER SIZING (per-trigger accumulator increment, USD)
+═══════════════════════════════════════════════════════════════════
+
+For NON-FAILED symbols, each trigger adds an order-size amount to
+the pending accumulator, computed as:
+
+    order_size_usd = contribution + BudgetR / 100
+
+where:
+  - contribution is this symbol's CURRENT cached per-trigger
+    contribution in USD, from the daily iterative weighting
+    recompute (see CONTRIBUTION WEIGHTING below) — the SAME
+    pre-existing value used elsewhere, not a new or separately-
+    tracked figure.
+  - BudgetR is this symbol's BudgetR value AFTER the BUDGET-R
+    update for this same trigger has already been applied (see
+    BUDGET-R above).
+
+This is the fully reduced form of "(1 + BudgetR / (contribution *
+100)) * contribution": expanding that product algebraically cancels
+one power of contribution against the contribution*100 term in the
+denominator, leaving exactly contribution + BudgetR/100 with no
+division by contribution anywhere in the final expression. contrib-
+ution therefore never appears as a divisor in this formula, and no
+divide-by-zero guard is needed for it here. contribution's only
+role in the final formula is as an additive floor: when BudgetR is
+0, order_size_usd reduces to exactly contribution, matching the
+pre-scaling per-trigger baseline.
+
+This order_size_usd REPLACES the previous flat per-trigger
+contribution as the accumulator increment. The accumulator itself
+continues to behave exactly as before: it accumulates across
+triggers, and a real order is only placed once its contract-
+equivalent at the triggering price clears the exchange minimum.
+
+═══════════════════════════════════════════════════════════════════
+FAILED-ORDER CARRY-FORWARD
+═══════════════════════════════════════════════════════════════════
+
+order_size_usd (see ORDER SIZING above) is added to the accumulator
+BEFORE a real order placement is attempted. If that placement then
+FAILS (rejected by the exchange, or any other placement failure),
+the accumulator is left exactly as it was after the addition — i.e.
+it is NOT reset to zero on failure, only on a SUCCESSFUL placement.
+This means a failed order's order_size_usd is automatically carried
+forward into the accumulation for the next trigger, rather than
+being discarded. No separate "re-add on failure" step exists or is
+needed; this falls directly out of the accumulator only ever being
+reset on the success path.
+
+═══════════════════════════════════════════════════════════════════
+CONTRIBUTION WEIGHTING (per-symbol $ per trigger)
+═══════════════════════════════════════════════════════════════════
+
+Each symbol's per-trigger contribution is scaled by a daily-
+recomputed allocation weight, derived from a trailing daily-close
+correlation / volatility analysis across all traded symbols, using
+an ITERATIVE FIXED-POINT weighting scheme:
+
+  1. For each symbol, fetch CONTRIB_LOOKBACK_DAYS of daily closes
+     and compute daily returns.
+  2. DATE-ALIGN all symbols' daily-close series onto the intersection
+     of UTC calendar dates present across every symbol, sorted
+     chronologically, BEFORE computing returns — so that return
+     series are compared date-for-date rather than index-for-index.
+     (See DATE ALIGNMENT below.)
+  3. Build the full pairwise Pearson correlation matrix across all
+     symbols' (now date-aligned) daily returns.
+  4. For each symbol, compute its "relative portfolio correlation"
+     as the column average of the correlation matrix EXCLUDING the
+     self-correlation (1.0) term — i.e. averaged over the other
+     (num_assets - 1) symbols only.
+  5. Compute annualized volatility from the daily return series for
+     every symbol, and clamp it to [0.0, CONTRIB_VOL_CAP] before it
+     is used as a divisor in the iteration below (see VOLATILITY
+     CAPPING below) — the raw, uncapped figure is retained
+     separately for logging/diagnostics.
+  6. Solve for a self-consistent weight vector via fixed-point
+     iteration (CONTRIB_ITERATIONS rounds) of:
+
+         w_i  <-  (1 / vol_i_capped) *
+                  sum_{j != i} [ (1 - corr_ij) * (1 - w_j) ]
+
+     renormalizing the full weight vector to sum to 1.0 after every
+     round. Weights start at equal-weight (1 / num_assets) and the
+     iteration is repeated CONTRIB_ITERATIONS times regardless of
+     convergence (a fixed iteration count, not a convergence
+     tolerance check), matching the reference implementation.
+  7. z_i, reported for diagnostics only, is the same expression
+     evaluated once more against the final converged weight vector:
+         z_i = (1 / vol_i_capped) *
+               sum_{j != i} [ (1 - corr_ij) * (1 - w_j) ]
+  8. Convert the final normalized weight to a per-trigger USD
+     contribution:
+         contribution = BASE_TRIGGER_USD * num_symbols * w_x
+     Under equal weighting this reduces to exactly BASE_TRIGGER_USD
+     ($1.00) per symbol, matching prior flat-$1 behavior. A symbol
+     weighted above the equal-weight baseline contributes more than
+     $1.00 per trigger; a symbol weighted below contributes less.
+
+This is recomputed ONCE PER UTC CALENDAR DAY (piggybacking on the
+same daily cadence as the budget accrual) and cached in persisted
+state. Every minute-trigger check within that day uses the cached
+per-symbol value — the daily-history network fetch and the
+iterative solve are never done inside the per-minute hot path.
+Because the BUDGET ACCRUAL step (see below) now depends on this
+same cached contribution value, the daily recompute is run BEFORE
+the accrual check within each engine cycle, so accrual always uses
+that day's freshly computed figure rather than a stale one.
+
+Each recompute cycle also writes a plain-text overview report
+(OVERVIEW_FILENAME) and an SVG correlation/weighting heatmap
+(SVG_FILENAME) to disk, summarizing the same run — see CONTRIBUTION
+REPORTING ARTIFACTS below.
+
+If the recompute fails outright (e.g. the exchange's daily-kline
+endpoint is unreachable for every symbol, or fewer than 2 symbols
+have usable date-aligned history), EVERY symbol falls back to flat
+BASE_TRIGGER_USD ($1.00) for that day, and recompute is retried at
+the next daily cycle. This is a pure fallback, not a cached carry-
+forward — a failed recompute does not reuse yesterday's values.
+
+═══════════════════════════════════════════════════════════════════
+BUDGET ACCRUAL
+═══════════════════════════════════════════════════════════════════
+
+At every UTC midnight (once per UTC calendar day, gated exactly as
+before via last_accrual_date), each symbol's running budget is
+credited with:
+
+    accrual_usd = 10.0 * contrib_per_trigger_usd(sym)
+
+using that symbol's CURRENT cached per-trigger contribution — i.e.
+the same value read by get_contrib_per_trigger_usd, which defaults
+to TRIGGER_STACK_USD ($1.00) for a symbol whose contribution has
+never yet been successfully computed. This means a brand-new symbol
+(or one for which the recompute has never once succeeded) accrues
+10 * $1.00 = $10.00 on that day, identical in magnitude to the
+former flat-$10 behavior, purely as a natural consequence of the
+existing default rather than as a separately-coded special case.
+This REPLACES the former flat BUDGET_DAILY_ACCRUAL_USD ($10.00)
+entirely; there is no longer a symbol-independent flat accrual.
+
+═══════════════════════════════════════════════════════════════════
+VOLATILITY CAPPING (iterative weighting stability)
+═══════════════════════════════════════════════════════════════════
+
+Annualized volatility is UNBOUNDED ABOVE: for a genuinely volatile
+instrument (crypto majors, single stocks, or any symbol going
+through a turbulent lookback window), ann_vol can readily exceed
+1.0 (100%). Because ann_vol (capped) is used as a DIVISOR in the
+iterative weighting formula (1 / vol_i_capped), an uncapped or
+near-zero raw volatility could otherwise produce either a distorted
+(if uncapped and very large, shrinking that symbol's influence
+unpredictably relative to the reference implementation's intended
+scale) or numerically unstable (if at or near zero) contribution.
+
+To prevent this, BEFORE every iteration cycle:
+  - ann_vol is clamped to [0.0, CONTRIB_VOL_CAP] (CONTRIB_VOL_CAP =
+    1.0) for use as the iteration's divisor.
+  - If the capped ann_vol is at or below a small floor
+    (CONTRIB_VOL_FLOOR = 0.0001), the floor value is used instead,
+    preventing division by zero for a symbol with a degenerate
+    (flat or single-observation) return series.
+A symbol whose raw volatility is clamped is logged so the event is
+visible; the clamp does not change the underlying raw volatility
+figure used elsewhere (e.g. in log output or the overview report),
+only the number fed into the iterative formula.
+
+Pearson correlation coefficients are already bounded to [-1, 1] by
+construction and are used directly in (1 - corr_ij) without a
+separate clamp, consistent with the reference iterative
+implementation.
+
+═══════════════════════════════════════════════════════════════════
+DATE ALIGNMENT (contribution-weighting inputs)
+═══════════════════════════════════════════════════════════════════
+
+Per-symbol daily closes are fetched independently, and different
+instruments (equities-style proxies vs. commodities vs. crypto) can
+have gapped, missing, or differently-timestamped daily candles. To
+avoid comparing returns at the same ARRAY INDEX but different
+CALENDAR DATES (which silently corrupts the correlation matrix),
+each symbol's raw {timestamp: close} map is first converted to a
+{UTC date: close} map (collapsing any intraday timestamp noise onto
+the calendar date, retaining the latest-timestamped close for that
+date if more than one falls on it). The set of common dates present
+for EVERY symbol that returned any data (the intersection) is then
+computed, sorted chronologically, and every symbol's return series
+is derived from that same ordered date list. If the resulting
+intersection is too small to compute a meaningful return series
+(fewer than 2 common dates), the recompute treats this the same as
+a total fetch failure and falls back to flat BASE_TRIGGER_USD for
+every symbol, consistent with the reference implementation's
+"insufficient overlapping trading days" abort condition.
+
+═══════════════════════════════════════════════════════════════════
+CONTRIBUTION REPORTING ARTIFACTS
+═══════════════════════════════════════════════════════════════════
+
+In addition to caching the per-symbol USD contribution for use by
+the minute-trigger engine, each successful daily recompute also
+writes two files to disk in the working directory:
+
+  - OVERVIEW_FILENAME ("portfolio_overview_90d.txt"): a structured,
+    human-readable text report covering the aligned date range,
+    correlation-matrix summary statistics, and a per-symbol table
+    of average correlation, annualized volatility (raw and capped),
+    final z-score, normalized weight, and contribution multiple.
+  - SVG_FILENAME ("portfolio_allocation_matrix_90d.svg"): a visual
+    correlation-matrix heatmap plus summary rows for relative
+    portfolio correlation, annualized volatility, parameter z,
+    normalized weight, and contribution per order, for every
+    symbol with usable data.
+
+Both are regenerated in full on every successful recompute and
+overwritten in place; neither is required for trading logic to
+function and a failure to write either is logged but does not
+affect the cached USD contributions already committed to state.
+
+═══════════════════════════════════════════════════════════════════
+FAILED SYMBOLS
+═══════════════════════════════════════════════════════════════════
+
+A symbol that fails its startup test order is flagged FAILED for
+the remainder of the process's lifetime. This excludes it from
+TRADING ONLY:
+  - No budget accrual.
+  - No accumulator, no order attempts, ever.
+
+It does NOT exclude the symbol from CHARTING or from BudgetR
+tracking:
+  - Its 1-minute buffer keeps refreshing every minute, same as any
+    other symbol.
+  - Its chart keeps rendering every minute, same as any other
+    symbol, and is linked from the main overview page exactly like
+    a healthy symbol.
+  - Trigger conditions are still evaluated every minute purely for
+    charting purposes (an "X marks the spot where this WOULD have
+    triggered" reference) and shown as small trigger markers on the
+    chart. Because failed symbols never call place_long, they never
+    have order markers — the chart legend distinguishes trigger
+    markers (small tick marks) from order markers (circles), and a
+    failed symbol's chart will only ever show the former.
+  - Its BudgetR is still updated on every trigger exactly per the
+    BUDGET-R rule above, purely for diagnostic/charting consistency,
+    even though BudgetR has no effect on trading for a failed
+    symbol (which never computes an order_size_usd or touches an
+    accumulator).
+
+═══════════════════════════════════════════════════════════════════
+CHARTS
+═══════════════════════════════════════════════════════════════════
+
+Each symbol — failed or not — gets its own SVG candlestick chart:
+the trailing 10 days of 1-minute candles, resampled to 15-minute
+OHLC candles (~960 candles). The chart marks:
+  - Whichever reference low is currently active (2d or 9d, based on
+    that symbol's budget sign) as a dashed horizontal threshold
+    line. For failed symbols (budget frozen at 0 or whatever it was
+    at time of failure), this still reflects budget sign the same
+    way.
+  - Every TRIGGER (candle low strictly less than the reference low,
+    excluding the current candle — see STRICT NEW-LOW SEMANTICS) as
+    a small tick marker on the price axis at that candle's
+    time/price.
+  - Every REAL ORDER placed for that symbol (never happens for
+    failed symbols) as a filled circle marker at its fire
+    time/price.
+
+Charts are re-rendered every minute, AFTER the minute-trigger
+trading logic runs, so chart rendering never delays order placement.
+Served at /chart/<SYMBOL>.svg and linked from the main overview page
+for every symbol, failed or not.
+
+═══════════════════════════════════════════════════════════════════
+MAIN OVERVIEW TABLE (/chart.svg)
+═══════════════════════════════════════════════════════════════════
+
+The main overview SVG (distinct from each symbol's own candlestick
+chart) renders a single bordered, monospaced, all-black tabular
+grid, one row per symbol, with a legend line above the grid mapping
+each abbreviated column header to its full name. Columns, in order:
+
+  Sym     Symbol code. A failed symbol has "[F]" appended directly
+          after its code (e.g. "BTC_USDT[F]") since a uniform black
+          color scheme no longer distinguishes failed symbols by
+          color the way the former red/blue/orange scheme did.
+  Trg     Total triggers recorded for this symbol (lifetime count
+          of triggers persisted for this symbol, independent of the
+          rolling chart-marker pruning window).
+  Ctb     Current per-trigger contribution in USD
+          (get_contrib_per_trigger_usd).
+  BudR    Current BudgetR value in USD for this symbol.
+  MOS     Minimum order size for this symbol, in contracts
+          (_mos(sym)).
+  Acc     Current accumulator value in USD.
+  AvgEnt  Average fill price across EXECUTED (successful) orders
+          only for this symbol (distinct from the daily-stats
+          avg_attempt_price, which averages over ALL attempts
+          including rejections) — "n/a" if this symbol has no
+          executed orders yet.
+  Exec    Count of executed (successful) real-order placements,
+          lifetime, for this symbol.
+  Fail    Count of failed (rejected) real-order placement attempts,
+          lifetime, for this symbol.
+  Exp     Total exposure: cumulative USD notional (unlevered) summed
+          across every executed order for this symbol, lifetime.
+
+All text is rendered in solid black (#000000). Gridlines and cell
+borders are drawn in a light gray for legibility without competing
+with the black text. The table height grows with the symbol count;
+width is fixed with column widths sized to comfortably fit the
+widest expected value per column.
+
+═══════════════════════════════════════════════════════════════════
+DAILY ACTIVITY REPORT (ntfy)
+═══════════════════════════════════════════════════════════════════
+
+Once per UTC calendar day, at or after 14:00 UTC, a plain-text
+activity report is pushed to the ntfy.sh topic
+"1618091301200506091401140305" (https://ntfy.sh/<topic>), one line
+per symbol, covering EVERY symbol currently configured in SYMBOLS
+(i.e. every actively-monitored symbol, whether presently trading or
+flagged FAILED — no symbol in SYMBOLS is ever omitted from the
+report), summarizing activity SINCE THE LAST SUCCESSFULLY SENT
+REPORT (not since UTC midnight):
+  - number of triggers
+  - order value (sum of USD on successfully placed orders)
+  - number of successful order placements
+  - number of unsuccessful order placements (rejected or below
+    minimum size)
+  - average price across all attempted order placements
+  - current per-trigger contribution in USD (as of report time)
+
+Per-symbol daily counters are NOT reset at UTC midnight. They reset
+ONLY immediately after a report has been successfully sent, so the
+reporting window is always "since the last report" — under normal
+operation this is ~24h (14:00 UTC to 14:00 UTC the next day), with
+no gap and no double-counted period. A restart near 14:00 UTC cannot
+cause a duplicate send: the guard requires both (a) current time is
+at/after 14:00 UTC, AND (b) at least 20 hours have passed since the
+last successful send.
+
+Failed symbols are still counted in the report (their trigger count
+will be nonzero if price action crossed their reference low; their
+order counts will always be 0/0 since no orders are ever attempted)
+so the report reflects that they're being watched but not traded.
+
+═══════════════════════════════════════════════════════════════════
+STARTUP TEST ORDERS
+═══════════════════════════════════════════════════════════════════
+
+  - On startup: run a one-time TEST order (limit LONG at market-10%,
+    sized at that symbol's own exchange-reported minimum order size)
+    against EVERY symbol, in three flat batch phases (no threads):
+      1. OPEN  — send a test limit LONG for every symbol.
+      2. WAIT  — sleep once, for TEST_ORDER_WAIT_SEC seconds.
+      3. CLOSE — check fill status and cancel/confirm for every
+         symbol that opened.
+
+    ANY failure at any phase flags that symbol FAILED for the
+    remainder of this process's lifetime — see FAILED SYMBOLS above
+    for exactly what that does and doesn't exclude. A test order
+    that fills during the wait is NOT a failure.
+
+═══════════════════════════════════════════════════════════════════
+LEVERAGE
+═══════════════════════════════════════════════════════════════════
+
+A single global LEVERAGE constant expresses the desired leverage
+for every symbol. However, each MEXC contract independently caps
+the maximum leverage it will accept (reported as "maxLeverage" in
+the contract-detail response fetched at startup). At every order
+placement (startup test orders AND minute-trigger real orders),
+the effective leverage submitted to the exchange is:
+
+    effective_leverage = min(LEVERAGE, symbol's maxLeverage)
+
+If the exchange does not report a maxLeverage for a given contract,
+the global LEVERAGE is used unmodified for that symbol as a safe
+fallback (no artificial cap is invented).
+
+Environment (secrets only, not behavior):
+  MEXC        - MEXC API key
+  MEXCSECRET  - MEXC API secret
+
+IMPORTANT:
+  Contract specifications are fetched live from MEXC at startup.
+  The bot does not hardcode priceUnit, volUnit, or contractSize.
 """
 
 import collections
@@ -27,69 +557,108 @@ try:
 except ImportError:
     pass
 
+
 # ── constants ─────────────────────────────────────────────────────────────────
 
 UTC = datetime.timezone.utc
 
-MEXC_KEY = os.getenv("MEXC")
+MEXC_KEY    = os.getenv("MEXC")
 MEXC_SECRET = os.getenv("MEXCSECRET")
-MEXC_BASE = "https://api.mexc.co"
+MEXC_BASE   = "https://api.mexc.co"
+
 
 # ── symbol configuration ──────────────────────────────────────────────────────
 
+
 SYMBOLS: List[str] = [
-    "USOIL_USDT",       # proxy for UOILUSD (WTI)
-    "URNM_USDT",        # proxy for URNMUSD
-    "BTC_USDT",         # proxy for BTCUSD
-    "ETH_USDT",         # proxy for ETHUSD
-    "SOL_USDT",         # proxy for SOLUSD
-    "XRP_USDT",         # proxy for XRPUSD
+    "USOIL_USDT",      # proxy for UOILUSD (WTI)
+    "URNM_USDT",       # proxy for URNMUSD
+    "BTC_USDT",        # proxy for BTCUSD
+    "ETH_USDT",        # proxy for ETHUSD
+    "SOL_USDT",        # proxy for SOLUSD
+    "XRP_USDT",        # proxy for XRPUSD
     "TRX_USDT",
-    "NGAS_USDT",        # Natural Gas
-    "XPD_USDT",         # Palladium
-    "XAU_USDT",         # Gold
-    "MSTRSTOCK_USDT",   # MicroStrategy
+    "NGAS_USDT",       # Natural Gas
+    "XPD_USDT",        # Palladium
+    "XAU_USDT",        # Gold
+    "MSTRSTOCK_USDT",  # MicroStrategy
     "UNITREE_USDT",
-    "SPX500_USDT",      # S&P 500 Index
-    "EWJ_USDT",         # iShares MSCI Japan ETF
-    "EWY_USDT",         # iShares MSCI South Korea ETF
-    "HK0700_USDT",      # Tencent Holdings (0700.HK)
-    "INDA_USDT",        # iShares MSCI India ETF
-    "EWT_USDT",         # iShares MSCI Taiwan ETF
-    "SMH_USDT",         # VanEck Semiconductor ETF
-    "COPPER_USDT",      # Copper
-    "BKRSTOCK_USDT",    # Baker Hughes
+    "SPX500_USDT",     # S&P 500 Index
+    "EWJ_USDT",        # iShares MSCI Japan ETF
+    "EWY_USDT",        # iShares MSCI South Korea ETF
+    "HK0700_USDT",     # Tencent Holdings (0700.HK)
+    "INDA_USDT",       # iShares MSCI India ETF
+    "EWT_USDT",        # iShares MSCI Taiwan ETF
+    "SMH_USDT",        # VanEck Semiconductor ETF
+    "COPPER_USDT",     # Copper
+    "BKRSTOCK_USDT",   # Baker Hughes
 ]
 
 LEVERAGE = 20
 
+
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_MULT = 1.0
-TRIGGER_STACK_USD = 1.0
-ORDER_SIZE_BUDGET_R_DIVISOR = 1000.0
+BUDGET_DAILY_ACCRUAL_MULT = 1.0     # daily budget accrual = this * that
+                                      # symbol's current per-trigger
+                                      # contribution in USD (see BUDGET
+                                      # ACCRUAL in the module docstring).
+                                      # Replaces the former flat
+                                      # BUDGET_DAILY_ACCRUAL_USD ($10).
+TRIGGER_STACK_USD        = 1.0       # default get_contrib_per_trigger_usd
+                                      # returns for a symbol whose
+                                      # contribution has never been computed.
 
-ROLL_MINUTES_SHORT = 2 * 24 * 60   # 2 days, in minutes -> "2d low"
-ROLL_MINUTES_LONG = 9 * 24 * 60    # 9 days, in minutes -> "9d low"
+ORDER_SIZE_BUDGET_R_DIVISOR = 1000.0  # order_size_usd = contribution +
+                                      # BudgetR / ORDER_SIZE_BUDGET_R_DIVISOR
+                                      # (see ORDER SIZING in the module
+                                      # docstring).
 
-MINUTE_CHECK_SECOND = 1  # run the check at :01 past each minute
+ROLL_MINUTES_SHORT = 2 * 24 * 60     # 2 days, in minutes -> "2d low"
+ROLL_MINUTES_LONG  = 9 * 24 * 60     # 9 days, in minutes -> "9d low"
+
+MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
+
 
 # ── contribution-weighting constants ──────────────────────────────────────────
 
-BASE_TRIGGER_USD = 1.0
-CONTRIB_LOOKBACK_DAYS = 90
-CONTRIB_VOL_CAP = 1.0
-CONTRIB_VOL_FLOOR = 0.0001
-CONTRIB_ITERATIONS = 50
-CONTRIB_MIN_COMMON_DATES = 2
+BASE_TRIGGER_USD = 1.0   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
 
+CONTRIB_LOOKBACK_DAYS = 90
+
+# Cap applied to annualized volatility immediately before it is used
+# as a divisor in the iterative weighting formula
+# w_i <- (1/vol_i) * sum_{j!=i}[(1-corr_ij)*(1-w_j)]. Without this
+# cap, ann_vol is unbounded above and can exceed 1.0 for genuinely
+# volatile symbols, distorting that symbol's influence in the
+# iteration relative to the reference implementation's intended
+# scale. See "VOLATILITY CAPPING" in the module docstring.
+CONTRIB_VOL_CAP   = 1.0     # ann_vol clamped to [0.0, CONTRIB_VOL_CAP]
+CONTRIB_VOL_FLOOR = 0.0001  # floor applied to the capped ann_vol before
+                             # it is used as a divisor, to avoid division
+                             # by zero for a degenerate return series
+
+CONTRIB_ITERATIONS = 50     # fixed-point iteration rounds for the
+                             # iterative weighting solve (matches the
+                             # reference implementation's iteration count)
+
+CONTRIB_MIN_COMMON_DATES = 2  # below this many common aligned dates,
+                               # treat the recompute as a total failure
+                               # and fall back to flat BASE_TRIGGER_USD
+
+# Contribution-weighting reporting artifacts (see CONTRIBUTION
+# REPORTING ARTIFACTS in the module docstring). Written fresh on
+# every successful recompute; a failure to write either is logged
+# but does not affect the cached USD contributions already
+# committed to state.
 OVERVIEW_FILENAME = "portfolio_overview_90d.txt"
-SVG_FILENAME = "portfolio_allocation_matrix_90d.svg"
+SVG_FILENAME      = "portfolio_allocation_matrix_90d.svg"
+
 
 # ── chart constants ────────────────────────────────────────────────────────────
 
-CHART_MINUTES = 10 * 24 * 60
-CHART_RESAMPLE_MIN = 15
+CHART_MINUTES       = 10 * 24 * 60   # 10 days of 1-minute history for the chart
+CHART_RESAMPLE_MIN  = 15             # resample 1m -> 15m OHLC candles
 
 BUFFER_MAX_MINUTES = max(ROLL_MINUTES_LONG, CHART_MINUTES) + 60
 
@@ -100,53 +669,64 @@ CHART_MARGIN_R = 20
 CHART_MARGIN_T = 40
 CHART_MARGIN_B = 40
 
+
 # ── overview table constants ────────────────────────────────────────────────────
 
 TABLE_COLUMNS: List[Tuple[str, str]] = [
-    ("Sym", "Symbol"),
-    ("Trg", "Total Triggers"),
-    ("Ctb", "Contribution/Trigger (USD)"),
-    ("BudR", "BudgetR (USD)"),
-    ("MOS", "Min Order Size (contracts)"),
-    ("Acc", "Accumulator (USD)"),
+    # (abbreviation, full name) — order defines column order and the
+    # legend line above the grid.
+    ("Sym",    "Symbol"),
+    ("Trg",    "Total Triggers"),
+    ("Ctb",    "Contribution/Trigger (USD)"),
+    ("BudR",   "BudgetR (USD)"),
+    ("MOS",    "Min Order Size (contracts)"),
+    ("Acc",    "Accumulator (USD)"),
     ("AvgEnt", "Average Entry Price"),
-    ("Exec", "Executed Orders"),
-    ("Fail", "Failed Orders"),
-    ("Exp", "Total Exposure (USD)"),
+    ("Exec",   "Executed Orders"),
+    ("Fail",   "Failed Orders"),
+    ("Exp",    "Total Exposure (USD)"),
 ]
 
-TABLE_ROW_H = 26
-TABLE_HEADER_H = 26
-TABLE_LEGEND_H = 34
-TABLE_TITLE_H = 30
-TABLE_MARGIN = 16
+TABLE_ROW_H       = 26
+TABLE_HEADER_H    = 26
+TABLE_LEGEND_H    = 34
+TABLE_TITLE_H     = 30
+TABLE_MARGIN      = 16
 TABLE_COL_W: Dict[str, int] = {
-    "Sym": 150,
-    "Trg": 60,
-    "Ctb": 90,
-    "BudR": 100,
-    "MOS": 100,
-    "Acc": 90,
+    "Sym":    150,
+    "Trg":    60,
+    "Ctb":    90,
+    "BudR":   100,
+    "MOS":    100,
+    "Acc":    90,
     "AvgEnt": 110,
-    "Exec": 70,
-    "Fail": 70,
-    "Exp": 110,
+    "Exec":   70,
+    "Fail":   70,
+    "Exp":    110,
 }
 TABLE_W = TABLE_MARGIN * 2 + sum(TABLE_COL_W.values())
 
+
 # ── daily activity report / ntfy constants ────────────────────────────────────
 
-NTFY_TOPIC = "1618091301200506091401140305"
-NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
-REPORT_HOUR_UTC = 14
+NTFY_TOPIC     = "1618091301200506091401140305"
+NTFY_URL       = f"https://ntfy.sh/{NTFY_TOPIC}"
+REPORT_HOUR_UTC   = 14
 REPORT_MINUTE_UTC = 0
+
 REPORT_MIN_INTERVAL_HOURS = 20
 
-# ── timing & startup test order ───────────────────────────────────────────────
+
+# ── timing ────────────────────────────────────────────────────────────────────
 
 HOURLY_SLEEP_FLOOR_SEC = 5
+
+
+# ── startup test order ────────────────────────────────────────────────────────
+
 TEST_ORDER_DISCOUNT = 0.90
 TEST_ORDER_WAIT_SEC = 20
+
 
 # ── failed-symbol tracking ────────────────────────────────────────────────────
 
@@ -155,12 +735,13 @@ _FAILED_LOCK = threading.Lock()
 
 
 def _xml_escape(s: str) -> str:
+    """Escapes text for safe embedding inside SVG/XML text content."""
     return _saxutils.escape(str(s))
-
 
 def flag_failed(sym: str, reason: str):
     with _FAILED_LOCK:
         FAILED_SYMBOLS.add(sym)
+
     log.error(
         f"[{sym}] FLAGGED FAILED — {reason} — "
         "excluded from trading (buffer/chart/trigger-marking continue)"
@@ -172,10 +753,11 @@ def is_failed(sym: str) -> bool:
         return sym in FAILED_SYMBOLS
 
 
-# ── HTTP server configuration ──────────────────────────────────────────────────
+# ── HTTP server ───────────────────────────────────────────────────────────────
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(os.getenv("PORT", "8080"))
+
 
 # ── persistence ──────────────────────────────────────────────────────────────
 
@@ -184,19 +766,29 @@ STATE_FILE = os.getenv(
     "/data/multi_dca_fire_history.json"
 )
 
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(message)s"
+    format="%(asctime)s  %(message)s"
 )
 
 log = logging.getLogger()
 
+
 specs: Dict[str, Dict] = {}
+
 
 # ── contribution-weighting calculation logic ──────────────────────────────────
 
-
 def fetch_30d_daily_closes(symbol: str) -> Dict[int, float]:
+    """Fetches trailing N-day daily kline data from MEXC API.
+
+    Returns a dict of {unix_timestamp: close}. Callers that need to
+    compare series across symbols must date-align first — see
+    align_price_series_by_date — rather than relying on raw
+    timestamps or array position, since different symbols' daily
+    candles are not guaranteed to fall on identical timestamps.
+    """
     now_s = int(time.time())
     start_s = now_s - (CONTRIB_LOOKBACK_DAYS * 86400)
     url = (
@@ -224,6 +816,13 @@ def fetch_30d_daily_closes(symbol: str) -> Dict[int, float]:
 
 
 def _to_date_keyed(price_dict: Dict[int, float]) -> Dict[datetime.date, float]:
+    """Collapses a {timestamp: close} map onto {UTC date: close}.
+
+    If more than one timestamp falls on the same UTC calendar date
+    (should not normally happen for Day1 candles, but is possible
+    around exchange maintenance/backfill artifacts), the
+    latest-timestamped close for that date wins.
+    """
     by_date: Dict[datetime.date, float] = {}
     for ts in sorted(price_dict.keys()):
         d = datetime.datetime.fromtimestamp(ts, tz=UTC).date()
@@ -234,6 +833,25 @@ def _to_date_keyed(price_dict: Dict[int, float]) -> Dict[datetime.date, float]:
 def align_price_series_by_date(
     price_dicts: Dict[str, Dict[int, float]]
 ) -> Tuple[List[datetime.date], Dict[str, "collections.OrderedDict[datetime.date, float]"]]:
+    """Date-aligns multiple symbols' {timestamp: close} maps.
+
+    Converts every symbol's raw timestamp-keyed series to a
+    date-keyed series, computes the intersection of UTC calendar
+    dates present across ALL symbols that returned any data, sorts
+    that intersection chronologically, and returns:
+
+      1. The sorted list of common dates (the shared date axis).
+      2. Each symbol's series restricted to exactly that common,
+         ordered date list.
+
+    This guarantees that index i in every returned series refers to
+    the same calendar date for every symbol, so that downstream
+    return/volatility/correlation calculations are comparing
+    like-for-like periods rather than misaligned array positions.
+
+    Symbols with no data at all are returned with an empty series.
+    If no symbol has any data, the common-dates list is empty.
+    """
     date_keyed: Dict[str, Dict[datetime.date, float]] = {
         sym: _to_date_keyed(pd) for sym, pd in price_dicts.items()
     }
@@ -260,7 +878,13 @@ def align_price_series_by_date(
     return ordered_dates, aligned
 
 
-def compute_daily_returns_ordered(series: "collections.OrderedDict") -> List[float]:
+def compute_daily_returns_ordered(
+    series: "collections.OrderedDict"
+) -> List[float]:
+    """Calculates daily percentage returns from an already
+    date-ordered OrderedDict, preserving its existing order rather
+    than re-sorting by key. Used for date-aligned series where the
+    keys are datetime.date objects already in chronological order."""
     values = list(series.values())
     returns = []
     for i in range(1, len(values)):
@@ -273,6 +897,15 @@ def compute_daily_returns_ordered(series: "collections.OrderedDict") -> List[flo
 
 
 def calculate_volatility(returns: List[float]) -> tuple:
+    """Calculates daily standard deviation and annualized volatility.
+
+    Both returned values are raw (uncapped) figures. Callers that
+    feed annualized volatility into the iterative weighting formula
+    must apply CONTRIB_VOL_CAP (and CONTRIB_VOL_FLOOR) themselves —
+    see compute_contribution_weights — rather than relying on this
+    function to clamp, so that raw volatility remains available for
+    logging/diagnostics undistorted.
+    """
     n = len(returns)
     if n < 2:
         return 0.0, 0.0
@@ -284,6 +917,15 @@ def calculate_volatility(returns: List[float]) -> tuple:
 
 
 def calculate_pearson_correlation(x: List[float], y: List[float]) -> float:
+    """Calculates Pearson correlation coefficient.
+
+    Callers are expected to pass in date-aligned return series (same
+    length, each index i referring to the same calendar-date
+    transition for both x and y). This function itself only
+    truncates to the shorter length as a defensive fallback; the
+    real alignment guarantee is provided upstream by
+    align_price_series_by_date.
+    """
     n = min(len(x), len(y))
     if n < 2:
         return 0.0
@@ -313,6 +955,12 @@ def _write_contribution_overview_report(
     order_contrib: Dict[str, float],
     filename: str = OVERVIEW_FILENAME,
 ):
+    """Writes a structured, human-readable overview of the
+    iterative contribution-weighting recompute to a text file,
+    summarizing the aligned date range, per-symbol metrics, and
+    matrix-level summary statistics. Failure to write is logged and
+    non-fatal — it does not affect the cached USD contributions
+    already committed to state."""
     try:
         num_assets = len(symbols)
 
@@ -432,6 +1080,10 @@ def _build_contribution_svg_heatmap(
     order_contrib: Dict[str, float],
     filename: str = SVG_FILENAME,
 ):
+    """Generates an XML SVG correlation-matrix heatmap plus summary
+    rows for the iterative contribution-weighting recompute.
+    Failure to write is logged and non-fatal — it does not affect
+    the cached USD contributions already committed to state."""
     try:
         n = len(symbols)
         cell_size = 45
@@ -558,6 +1210,13 @@ def _build_contribution_svg_heatmap(
 
 
 def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float]]:
+    """Runs the full iterative contribution-weighting recompute:
+    fetch -> date-align -> correlate -> fixed-point-iterate ->
+    normalize -> convert to USD-per-trigger -> write reporting
+    artifacts. Returns None (total failure, caller falls back to
+    flat BASE_TRIGGER_USD for every symbol) if no symbol returned
+    usable data, or if fewer than CONTRIB_MIN_COMMON_DATES common
+    aligned dates survive across all symbols."""
     raw_closes: Dict[str, Dict[int, float]] = {}
     any_fetch_succeeded = False
 
@@ -572,7 +1231,10 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
 
         if n_candles < CONTRIB_LOOKBACK_DAYS:
             log.warning(
-                f"[{sym}] fetched {n_candles} candles, short of requested {CONTRIB_LOOKBACK_DAYS}d"
+                f"[{sym}] fetched {n_candles} candles, short of the "
+                f"requested {CONTRIB_LOOKBACK_DAYS}d — MEXC may not "
+                "have that much history, or the request was "
+                "truncated/rate-limited"
             )
         if closes:
             any_fetch_succeeded = True
@@ -580,25 +1242,50 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
         raw_closes[sym] = closes
 
     if not any_fetch_succeeded:
-        log.error("contribution-weighting recompute: ALL daily-close fetches failed")
+        log.error(
+            "contribution-weighting recompute: ALL daily-close "
+            "fetches failed — total outage, caller will fall back "
+            "to flat BASE_TRIGGER_USD for every symbol"
+        )
         return None
 
+    # Date-align every symbol's series onto the common intersection
+    # of UTC calendar dates BEFORE computing returns, so that return
+    # series are compared date-for-date rather than by raw array
+    # index (which could otherwise silently mix mismatched dates
+    # across symbols with different trading calendars/candle gaps).
     common_dates, aligned = align_price_series_by_date(raw_closes)
 
     log.info(
-        f"contribution-weighting: date-aligned to {len(common_dates)} common UTC dates"
+        f"contribution-weighting: date-aligned to "
+        f"{len(common_dates)} common UTC calendar date(s) "
+        f"across {len(symbols)} symbols"
     )
 
     if len(common_dates) < CONTRIB_MIN_COMMON_DATES:
         log.error(
-            f"contribution-weighting recompute: only {len(common_dates)} dates survived"
+            f"contribution-weighting recompute: only "
+            f"{len(common_dates)} common aligned date(s) survived "
+            f"across all symbols, short of the required "
+            f"{CONTRIB_MIN_COMMON_DATES} — treating as a total "
+            "recompute failure, caller will fall back to flat "
+            "BASE_TRIGGER_USD for every symbol"
         )
         return None
 
+    # Only symbols that actually have data participate in the
+    # correlation/iteration; a symbol with zero fetched candles has
+    # an empty aligned series and would otherwise contribute
+    # degenerate (all-zero) statistics into the matrix.
     valid_symbols = [sym for sym in symbols if raw_closes.get(sym)]
 
     if len(valid_symbols) < 2:
-        log.error("contribution-weighting recompute: fewer than 2 symbols with usable data")
+        log.error(
+            f"contribution-weighting recompute: only "
+            f"{len(valid_symbols)} symbol(s) returned usable data — "
+            "need at least 2 to build a correlation matrix, "
+            "treating as a total recompute failure"
+        )
         return None
 
     returns_data: Dict[str, List[float]] = {}
@@ -614,6 +1301,7 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
     num_assets = len(valid_symbols)
     corr_matrix: Dict[str, Dict[str, float]] = {s1: {} for s1 in valid_symbols}
 
+    # 1. Correlation matrix over the date-aligned window.
     for sym1 in valid_symbols:
         for sym2 in valid_symbols:
             if sym1 == sym2:
@@ -623,6 +1311,9 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
                     returns_data[sym1], returns_data[sym2]
                 )
 
+    # 2. Relative Portfolio Correlation — column averages,
+    #    EXCLUDING the self-correlation (1.0) term, per the
+    #    iterative weighting scheme's definition.
     col_averages: Dict[str, float] = {}
     for col_sym in valid_symbols:
         if num_assets > 1:
@@ -635,6 +1326,10 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
         else:
             col_averages[col_sym] = 0.0
 
+    # Pre-compute the capped, floored volatility divisor for every
+    # symbol once, ahead of the iteration loop, and log any symbol
+    # whose raw volatility required clamping. See VOLATILITY
+    # CAPPING in the module docstring.
     vol_divisor: Dict[str, float] = {}
     for sym in valid_symbols:
         raw_ann_vol = vol_data[sym]["annualized"]
@@ -642,11 +1337,22 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
 
         if raw_ann_vol > CONTRIB_VOL_CAP:
             log.warning(
-                f"[{sym}] annualized vol {raw_ann_vol:.3f} > cap {CONTRIB_VOL_CAP:.3f} — clamped"
+                f"[{sym}] annualized volatility {raw_ann_vol:.3f} "
+                f"exceeds cap {CONTRIB_VOL_CAP:.3f} — clamped to "
+                f"{capped:.3f} for iterative weighting purposes "
+                "(raw figure retained for diagnostics)"
             )
 
         vol_divisor[sym] = max(capped, CONTRIB_VOL_FLOOR)
 
+    # 3. Fixed-point iteration to converge on the interdependent
+    #    weights:
+    #        w_i <- (1/vol_i_capped) *
+    #               sum_{j!=i}[(1-corr_ij)*(1-w_j)]
+    #    renormalized to sum to 1.0 after every round. Weights start
+    #    at equal-weight and the loop runs CONTRIB_ITERATIONS times
+    #    unconditionally (fixed count, not a convergence check),
+    #    matching the reference implementation.
     weights: Dict[str, float] = {sym: 1.0 / num_assets for sym in valid_symbols}
 
     for _ in range(CONTRIB_ITERATIONS):
@@ -661,8 +1367,16 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
 
         total_new_w = sum(new_weights.values())
         if total_new_w > 0:
-            weights = {sym: w / total_new_w for sym, w in new_weights.items()}
+            weights = {
+                sym: w / total_new_w for sym, w in new_weights.items()
+            }
+        # If total_new_w <= 0 (degenerate case), retain the previous
+        # round's weights rather than dividing by zero or collapsing
+        # to an undefined state.
 
+    # 4. z-scores, reported for diagnostics only: the same
+    #    expression evaluated once more against the final converged
+    #    weight vector.
     z_scores: Dict[str, float] = {}
     for sym1 in valid_symbols:
         w_sum = sum(
@@ -672,15 +1386,24 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
         )
         z_scores[sym1] = (1.0 / vol_divisor[sym1]) * w_sum
 
+    # 5. Convert normalized weight to a per-trigger USD contribution.
+    #    Under equal weighting this reduces to exactly
+    #    BASE_TRIGGER_USD per symbol.
     contrib_per_trigger_usd: Dict[str, float] = {
         sym: BASE_TRIGGER_USD * num_assets * weights[sym]
         for sym in valid_symbols
     }
 
+    # Any symbol in `symbols` that did not make it into
+    # `valid_symbols` (no fetched data at all) falls back to flat
+    # BASE_TRIGGER_USD individually, rather than being silently
+    # dropped from the cached contribution map.
     for sym in symbols:
         if sym not in contrib_per_trigger_usd:
             log.warning(
-                f"[{sym}] excluded from iterative weighting — using flat ${BASE_TRIGGER_USD:.2f}"
+                f"[{sym}] excluded from iterative weighting (no "
+                "usable data) — falling back to flat "
+                f"${BASE_TRIGGER_USD:.2f} for this symbol today"
             )
             contrib_per_trigger_usd[sym] = BASE_TRIGGER_USD
 
@@ -706,17 +1429,20 @@ def compute_contribution_weights(symbols: List[str]) -> Optional[Dict[str, float
 
 # ── shared state ──────────────────────────────────────────────────────────────
 
-
 class SharedState:
 
     def __init__(self):
         self._lock = threading.Lock()
+
         self._svg = (
-            "<svg xmlns='http://www.w3.org/2000/svg' width='600' height='100'>"
+            "<svg xmlns='http://www.w3.org/2000/svg' "
+            "width='600' height='100'>"
             "<text x='10' y='50'>Initializing...</text>"
             "</svg>"
         )
+
         self._status = "initializing"
+
         self._chart_svgs: Dict[str, str] = {}
 
     def set_svg(self, svg: str):
@@ -743,15 +1469,16 @@ class SharedState:
         with self._lock:
             return self._chart_svgs.get(
                 sym,
-                "<svg xmlns='http://www.w3.org/2000/svg' width='400' height='60'>"
-                "<text x='10' y='30' font-family='Courier New'>Loading chart...</text></svg>"
+                "<svg xmlns='http://www.w3.org/2000/svg' width='400' "
+                "height='60'><text x='10' y='30' "
+                "font-family='Courier New'>Loading chart...</text></svg>"
             )
 
 
 STATE = SharedState()
 
-# ── persisted state ──────────────────────────────────────────────────────────
 
+# ── persisted state ──────────────────────────────────────────────────────────
 
 def _default_daily_stats(now_iso: str) -> Dict:
     return {
@@ -832,13 +1559,21 @@ def get_budget_r(sym: str) -> float:
 
 
 def init_budget_r_if_absent(sym: str):
+    """Initializes BudgetR to the symbol's current running budget,
+    but ONLY if this symbol has no BudgetR entry at all yet (first
+    run, or a symbol newly added to SYMBOLS). An existing BudgetR
+    value carried over from a prior run is never overwritten by
+    this step — see BUDGET-R in the module docstring."""
     with _STATE_DATA_LOCK:
         if sym in STATE_DATA["budget_r"]:
             return
         starting_value = float(STATE_DATA["budget"].get(sym, 0.0))
         STATE_DATA["budget_r"][sym] = starting_value
         _persist()
-        log.info(f"[{sym}] BudgetR initialized to current budget: ${starting_value:.2f}")
+        log.info(
+            f"[{sym}] BudgetR initialized to current budget: "
+            f"${starting_value:.2f}"
+        )
 
 
 def get_last_trigger_low(sym: str) -> Optional[float]:
@@ -893,11 +1628,22 @@ def accrue_daily_budget_if_due(sym: str, today: datetime.date):
         _persist()
 
         log.info(
-            f"[{sym}] daily budget accrual: {prev_budget:.2f} + {accrual:.2f} = {new_budget:.2f}"
+            f"[{sym}] daily budget accrual "
+            f"({BUDGET_DAILY_ACCRUAL_MULT:.1f} x contrib "
+            f"${contrib:.3f} = ${accrual:.3f}): "
+            f"{prev_budget:.2f} + {accrual:.2f} "
+            f"= {new_budget:.2f}"
         )
 
 
 def update_budget_r_on_trigger(sym: str, candle_low: float) -> float:
+    """Applies the BUDGET-R update rule for a single trigger and
+    returns the resulting BudgetR value (post-update) for immediate
+    use in the order-sizing formula. See BUDGET-R in the module
+    docstring for the full rule. Also records this trigger's
+    candle_low as the new last_trigger_low for the NEXT trigger's
+    comparison, and increments this symbol's lifetime trigger
+    count."""
     with _STATE_DATA_LOCK:
         prev_low = get_last_trigger_low(sym)
 
@@ -908,24 +1654,35 @@ def update_budget_r_on_trigger(sym: str, candle_low: float) -> float:
         if is_new_trigger_low:
             new_budget_r = get_budget_r(sym)
             log.info(
-                f"[{sym}] BudgetR unchanged (low {candle_low:.4f} < prev {prev_low:.4f}): BudgetR=${new_budget_r:.2f}"
+                f"[{sym}] BudgetR unchanged (this trigger low "
+                f"{candle_low:.4f} < previous trigger low "
+                f"{prev_low:.4f}): BudgetR=${new_budget_r:.2f}"
             )
         else:
             new_budget_r = get_budget(sym)
             STATE_DATA["budget_r"][sym] = new_budget_r
+            reason = (
+                "no previous trigger on record"
+                if prev_low is None
+                else (
+                    f"this trigger low {candle_low:.4f} did not set "
+                    f"a new low vs previous trigger low {prev_low:.4f}"
+                )
+            )
             log.info(
-                f"[{sym}] BudgetR reset to live budget: BudgetR=${new_budget_r:.2f}"
+                f"[{sym}] BudgetR reset to live budget ({reason}): "
+                f"BudgetR=${new_budget_r:.2f}"
             )
 
         STATE_DATA["last_trigger_low"][sym] = candle_low
         STATE_DATA["trigger_count"][sym] = get_trigger_count(sym) + 1
 
         _persist()
+
         return new_budget_r
 
 
 # ── contribution-weighting cache accessors ────────────────────────────────────
-
 
 def get_contrib_per_trigger_usd(sym: str) -> float:
     return float(
@@ -956,23 +1713,54 @@ def recompute_contributions_if_due(today: datetime.date, force: bool = False):
     if not force and last == today:
         return
 
-    log.info(f"contribution-weighting recompute due (last={last}, today={today})")
+    log.info(
+        f"contribution-weighting recompute due "
+        f"(last={last}, today={today}, force={force}) — running "
+        f"iterative {CONTRIB_LOOKBACK_DAYS}-day analysis over "
+        f"{len(SYMBOLS)} symbols"
+    )
+
     result = compute_contribution_weights(SYMBOLS)
 
     if result is None:
-        log.error("contribution-weighting recompute FAILED — using flat fallback")
+        log.error(
+            "contribution-weighting recompute FAILED (total outage "
+            "or insufficient aligned history) — falling back to "
+            f"flat ${BASE_TRIGGER_USD:.2f} for every symbol today"
+        )
         result = {sym: BASE_TRIGGER_USD for sym in SYMBOLS}
 
     set_contrib_per_trigger_usd(result, today)
 
 
 def compute_order_size_usd(sym: str, budget_r: float) -> float:
+    """Computes the per-trigger accumulator increment (USD):
+
+        order_size_usd = contribution + BudgetR / 100
+
+    This is the fully-reduced form of
+    "(1 + BudgetR/(contribution*100)) * contribution" — expanding
+    that product cancels one power of contribution against the
+    contribution*100 term in the denominator, leaving exactly
+    contribution + BudgetR/100 with no division by contribution
+    anywhere in the final expression. See ORDER SIZING in the
+    module docstring for the full derivation. contribution is this
+    symbol's CURRENT cached per-trigger contribution (the same
+    pre-existing value used elsewhere, not a new figure); BudgetR is
+    the value AFTER this trigger's BUDGET-R update has already been
+    applied.
+
+    contribution never appears as a divisor in this formula, so no
+    divide-by-zero guard is required here.
+    """
     contribution = get_contrib_per_trigger_usd(sym)
+
     order_size_usd = contribution + (budget_r / ORDER_SIZE_BUDGET_R_DIVISOR)
 
     log.info(
-        f"[{sym}] order-sizing: contrib ${contribution:.3f} + "
-        f"(BudgetR ${budget_r:.2f} / {ORDER_SIZE_BUDGET_R_DIVISOR:.0f}) = ${order_size_usd:.4f}"
+        f"[{sym}] order-sizing: contribution ${contribution:.3f} + "
+        f"(BudgetR ${budget_r:.2f} / {ORDER_SIZE_BUDGET_R_DIVISOR:.0f}) "
+        f"= ${order_size_usd:.4f}"
     )
 
     return order_size_usd
@@ -1003,7 +1791,10 @@ def spend_budget(sym: str, usd: float):
         new = prev - usd
         STATE_DATA["budget"][sym] = new
         _persist()
-        log.info(f"[{sym}] budget spent ${usd:.2f}: {prev:.2f} -> {new:.2f}")
+        log.info(
+            f"[{sym}] budget spent ${usd:.2f}: "
+            f"{prev:.2f} -> {new:.2f}"
+        )
 
 
 def set_last_seen_minute(sym: str, minute_dt: datetime.datetime):
@@ -1057,6 +1848,11 @@ def total_orders_count() -> int:
 
 
 def executed_orders_for_sym(sym: str) -> List[Dict]:
+    """Real (non-test) successfully-executed orders for this symbol,
+    i.e. those placed via the minute-trigger engine's success path,
+    identified by carrying a 'reference_window' key (mirrors the
+    same identification test used elsewhere, e.g. in chart order
+    markers and render_svg's fire count)."""
     return [
         o for o in STATE_DATA["orders"]
         if o.get("symbol") == sym and "reference_window" in o
@@ -1064,6 +1860,11 @@ def executed_orders_for_sym(sym: str) -> List[Dict]:
 
 
 def record_lifetime_order_outcome(sym: str, success: bool):
+    """Tracks LIFETIME (never-reset) executed/failed order counts
+    per symbol, separate from the daily-stats counters (which reset
+    on each successfully sent activity report) — needed because the
+    overview table's Exec/Fail columns are meant to reflect
+    persistent history, not a rolling reporting window."""
     with _STATE_DATA_LOCK:
         key = "lifetime_orders_ok" if success else "lifetime_orders_failed"
         STATE_DATA[key][sym] = int(STATE_DATA[key].get(sym, 0)) + 1
@@ -1076,8 +1877,7 @@ def get_lifetime_order_counts(sym: str) -> Tuple[int, int]:
     return ok, failed
 
 
-# ── daily stats ───────────────────────────────────────────────────────────────
-
+# ── daily stats (activity report counters) ────────────────────────────────────
 
 def _ensure_daily_stats_initialized(sym: str):
     with _STATE_DATA_LOCK:
@@ -1149,8 +1949,13 @@ def set_last_report_sent_at(dt: datetime.datetime):
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-
-def _http(method, url, headers=None, data=None, params=None):
+def _http(
+    method,
+    url,
+    headers=None,
+    data=None,
+    params=None
+):
     if params:
         url += "?" + urllib.parse.urlencode(sorted(params.items()))
 
@@ -1177,8 +1982,12 @@ def _get(url):
 
 # ── MEXC signed requests ─────────────────────────────────────────────────────
 
-
-def mexc(method, endpoint, params=None, body=None):
+def mexc(
+    method,
+    endpoint,
+    params=None,
+    body=None
+):
     params = params or {}
     ts = str(int(time.time() * 1000))
 
@@ -1227,7 +2036,6 @@ def mexc(method, endpoint, params=None, body=None):
 
 # ── ntfy ──────────────────────────────────────────────────────────────────────
 
-
 def ntfy_send(message: str, title: Optional[str] = None) -> bool:
     headers = {"Content-Type": "text/plain; charset=utf-8"}
     if title:
@@ -1252,12 +2060,16 @@ def ntfy_send(message: str, title: Optional[str] = None) -> bool:
 
 # ── contract specifications ───────────────────────────────────────────────────
 
-
 def load_specs():
-    rows = mexc("GET", "/api/v1/contract/detail").get("data") or []
+    rows = (
+        mexc("GET", "/api/v1/contract/detail").get("data") or []
+    )
 
     if not rows:
-        log.error("empty contract detail response from MEXC — flagging all symbols failed")
+        log.error(
+            "empty contract detail response from MEXC — "
+            "flagging all symbols failed"
+        )
         for sym in SYMBOLS:
             flag_failed(sym, "empty contract detail response from MEXC")
         return
@@ -1271,7 +2083,6 @@ def load_specs():
             continue
 
         vu = float(match.get("volUnit", 1))
-        mv = float(match.get("minVol", vu))  # MOS logic: minimum order contracts
         pu = float(match.get("priceUnit", 0.01))
         cs = float(match.get("contractSize", vu))
 
@@ -1290,7 +2101,6 @@ def load_specs():
             "p": p,
             "t": pu,
             "vu": vu,
-            "mv": mv,
             "cs": cs,
             "max_lev": max_lev,
         }
@@ -1330,10 +2140,15 @@ def _contracts(sym, usd, price):
 
 
 def _mos(sym):
-    return specs.get(sym, {}).get("mv", specs.get(sym, {}).get("vu", 1.0))
+    return specs.get(sym, {}).get("vu", 1.0)
 
 
 def _effective_leverage(sym: str) -> int:
+    """Returns the leverage to actually submit with orders for this
+    symbol: the global LEVERAGE, capped at the exchange-reported
+    maxLeverage for that contract if one is known. Falls back to
+    the global LEVERAGE unmodified when maxLeverage was not reported
+    or could not be parsed at spec-load time."""
     max_lev = specs.get(sym, {}).get("max_lev")
 
     if max_lev is None:
@@ -1341,7 +2156,9 @@ def _effective_leverage(sym: str) -> int:
 
     if max_lev < LEVERAGE:
         log.info(
-            f"[{sym}] global leverage {LEVERAGE}x exceeds exchange max {max_lev:.0f}x — using {max_lev:.0f}x"
+            f"[{sym}] global leverage {LEVERAGE}x exceeds exchange "
+            f"maximum {max_lev:.0f}x for this symbol — using "
+            f"{max_lev:.0f}x instead"
         )
         return int(max_lev)
 
@@ -1349,7 +2166,6 @@ def _effective_leverage(sym: str) -> int:
 
 
 # ── open orders ───────────────────────────────────────────────────────────────
-
 
 def _open_orders_for_sym(sym: str) -> List[Dict]:
     data = (
@@ -1376,7 +2192,6 @@ def _open_ids(sym: str) -> set:
 
 # ── order placement ──────────────────────────────────────────────────────────
 
-
 def place_long(
     sym: str,
     limit_price: float,
@@ -1387,7 +2202,9 @@ def place_long(
 
     if vol < _mos(sym):
         log.warning(
-            f"[{sym}] size {vol} < min {_mos(sym)} (${usd_amount:.2f}) — order skipped"
+            f"[{sym}] size {vol} < min "
+            f"{_mos(sym)} (${usd_amount:.2f}) "
+            "— order skipped"
         )
         return "SKIP"
 
@@ -1426,7 +2243,7 @@ def _place_long_contracts(
     data = r.get("data") or {}
 
     if not isinstance(data, dict):
-        log.error(f"[{sym}] unexpected 'data' shape: {data!r}")
+        log.error(f"[{sym}] unexpected 'data' shape from order/create: {data!r}")
         return None
 
     oid = data.get("orderId")
@@ -1438,15 +2255,17 @@ def _place_long_contracts(
     oid = str(oid)
 
     log.info(
-        f"[{sym}] limit LONG {_rfmt_vol(sym, vol)} @ {_rfmt_price(sym, limit_price)} "
-        f"leverage={leverage}x id={oid}"
+        f"[{sym}] limit LONG "
+        f"{_rfmt_vol(sym, vol)} "
+        f"@ {_rfmt_price(sym, limit_price)} "
+        f"leverage={leverage}x "
+        f"id={oid}"
     )
 
     return oid
 
 
 # ── cancel order ──────────────────────────────────────────────────────────────
-
 
 def cancel_order(sym: str, oid: str) -> bool:
     body = [oid]
@@ -1467,7 +2286,6 @@ def is_filled(sym: str, oid: str) -> bool:
 
 # ── mark price ────────────────────────────────────────────────────────────────
 
-
 def get_mark(sym: str) -> float:
     d = (
         mexc(
@@ -1483,7 +2301,6 @@ def get_mark(sym: str) -> float:
 
 
 # ── 1-minute klines ───────────────────────────────────────────────────────────
-
 
 def fetch_minute_bars(
     sym: str,
@@ -1545,7 +2362,6 @@ def fetch_minute_bars(
 
 # ── per-symbol rolling 1-minute OHLC buffer ───────────────────────────────────
 
-
 class MinuteBuffer:
 
     def __init__(self):
@@ -1590,6 +2406,18 @@ class MinuteBuffer:
         window_minutes: int,
         exclude_latest: bool = False
     ) -> Optional[float]:
+        """Returns the minimum low across closed candles within the
+        trailing window_minutes.
+
+        If exclude_latest is True, the most recent bar in the buffer
+        (i.e. the current/just-closed candle under evaluation) is
+        omitted from the set being scanned, so the result reflects
+        only PRIOR candles in the window. This is required for
+        strict new-low trigger evaluation — see STRICT NEW-LOW
+        SEMANTICS in the module docstring — where the current
+        candle must be compared against the rest of the window
+        rather than against a set that trivially includes itself.
+        """
         with self.lock:
             if not self.bars:
                 return None
@@ -1621,6 +2449,7 @@ MINUTE_BUFFERS: Dict[str, MinuteBuffer] = {
     sym: MinuteBuffer() for sym in SYMBOLS
 }
 
+
 SEED_CHUNK_MINUTES = 1500
 SEED_MAX_CHUNKS = (BUFFER_MAX_MINUTES // SEED_CHUNK_MINUTES) + 3
 
@@ -1642,11 +2471,22 @@ def seed_minute_buffer(sym: str):
         chunks_fetched += 1
 
         if not bars:
-            log.info(f"[{sym}] seed chunk returned no bars — stopping")
+            log.info(
+                f"[{sym}] seed chunk "
+                f"[{chunk_start_s}, {chunk_end_s}) returned no bars "
+                "— stopping (likely reached start of available history)"
+            )
             break
 
         for b in bars:
             all_bars[b["t"]] = b
+
+        log.info(
+            f"[{sym}] seed chunk "
+            f"[{chunk_start_s}, {chunk_end_s}): "
+            f"{len(bars)} bars fetched, "
+            f"{len(all_bars)} total so far"
+        )
 
         earliest_returned = min(b["t"] for b in bars)
         chunk_end_s = earliest_returned
@@ -1664,8 +2504,21 @@ def seed_minute_buffer(sym: str):
     )
 
     log.info(
-        f"[{sym}] minute buffer seeded: {MINUTE_BUFFERS[sym].size()} bars spanning ~{span_days:.1f}d"
+        f"[{sym}] minute buffer seeded: "
+        f"{MINUTE_BUFFERS[sym].size()} bars "
+        f"across {chunks_fetched} chunk(s), "
+        f"spanning ~{span_days:.1f} days "
+        f"(target: {BUFFER_MAX_MINUTES / 1440:.1f} days)"
     )
+
+    if span_days < (BUFFER_MAX_MINUTES / 1440.0) * 0.9:
+        log.warning(
+            f"[{sym}] seeded buffer spans only ~{span_days:.1f} days, "
+            f"short of the ~{BUFFER_MAX_MINUTES / 1440:.1f}-day target — "
+            "9d-low reference and 10d chart will be based on "
+            "incomplete history until the buffer naturally fills in "
+            "over the next few days of minute-by-minute updates"
+        )
 
 
 def refresh_minute_buffer(sym: str):
@@ -1677,7 +2530,6 @@ def refresh_minute_buffer(sym: str):
 
 
 # ── resampling for charts ─────────────────────────────────────────────────────
-
 
 def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
     if not bars:
@@ -1706,14 +2558,16 @@ def resample_ohlc(bars: List[Dict], bucket_minutes: int) -> List[Dict]:
 
 # ── minute-trigger engine ─────────────────────────────────────────────────────
 
-
 def evaluate_trigger(sym: str, now_utc: datetime.datetime):
     refresh_minute_buffer(sym)
     buf = MINUTE_BUFFERS[sym]
     latest = buf.latest_closed()
 
     if latest is None:
-        log.warning(f"[{sym}] no closed 1-minute candle available yet — skipping")
+        log.warning(
+            f"[{sym}] no closed 1-minute candle available yet "
+            "— skipping this minute"
+        )
         return None
 
     candle_dt = datetime.datetime.fromtimestamp(latest["t"], tz=UTC)
@@ -1734,18 +2588,32 @@ def evaluate_trigger(sym: str, now_utc: datetime.datetime):
         ref_window = ROLL_MINUTES_LONG
         ref_label = "9d"
 
+    # exclude_latest=True: the reference low must reflect only
+    # candles PRIOR to the one currently under evaluation, so that
+    # a trigger requires a genuine new low relative to the rest of
+    # the window rather than the current candle trivially matching
+    # itself as the window minimum. See STRICT NEW-LOW SEMANTICS.
     ref_low = buf.rolling_low(ref_window, exclude_latest=True)
 
     if ref_low is None:
-        log.warning(f"[{sym}] insufficient prior-candle data for {ref_label} low")
+        log.warning(
+            f"[{sym}] insufficient prior-candle data to compute "
+            f"{ref_label} low (excluding current candle) — "
+            "skipping this minute"
+        )
         return None
 
+    # Strict inequality: the current candle's low must be lower
+    # than every other low in the window, not merely tied with it.
     triggered = candle_low < ref_low
 
     log.info(
         f"[{sym}] minute check {candle_dt.isoformat()}: "
-        f"low={candle_low:.4f} {ref_label}Low(prior)={ref_low:.4f} "
-        f"budget={budget:.2f} failed={is_failed(sym)} trigger={triggered}"
+        f"low={candle_low:.4f} "
+        f"{ref_label}Low(prior)={ref_low:.4f} "
+        f"budget={budget:.2f} "
+        f"failed={is_failed(sym)} "
+        f"trigger={triggered}"
     )
 
     return candle_dt, candle_low, ref_label, triggered
@@ -1771,11 +2639,17 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     record_trigger_marker(sym, candle_dt, candle_low, ref_label)
     record_trigger_stat(sym)
 
+    # BudgetR is updated for EVERY trigger, failed symbols included,
+    # per the BUDGET-R rule — see module docstring. This must happen
+    # BEFORE the order-sizing formula is evaluated, since the
+    # formula consumes the POST-update BudgetR value.
     budget_r_now = update_budget_r_on_trigger(sym, candle_low)
 
     if failed:
         log.info(
-            f"[{sym}] TRIGGER (failed symbol, marker-only) @ price={candle_low:.4f} BudgetR=${budget_r_now:.2f}"
+            f"[{sym}] TRIGGER (failed symbol, marker-only, "
+            f"no accumulation) @ price={candle_low:.4f} "
+            f"BudgetR=${budget_r_now:.2f}"
         )
         return
 
@@ -1783,19 +2657,24 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     pending = add_order_size_to_accumulator(sym, order_size_usd)
 
     log.info(
-        f"[{sym}] TRIGGER — accumulator now ${pending:.2f} (+$${order_size_usd:.4f}) @ price={candle_low:.4f}"
+        f"[{sym}] TRIGGER — accumulator now ${pending:.2f} "
+        f"(order_size=${order_size_usd:.4f} added this trigger) "
+        f"@ price={candle_low:.4f}"
     )
 
     vol_at_price = _contracts(sym, pending, candle_low)
 
     if vol_at_price < _mos(sym):
         log.info(
-            f"[{sym}] accumulator ${pending:.2f} below min size ({_mos(sym)} contracts @ {candle_low:.4f}) — stacking"
+            f"[{sym}] accumulator ${pending:.2f} still below "
+            f"min order size ({_mos(sym)} contracts @ "
+            f"{candle_low:.4f}) — stacking, no order placed"
         )
         return
 
     log.info(
-        f"[{sym}] accumulator ${pending:.2f} reaches min size — attempting limit LONG @ {candle_low:.4f}"
+        f"[{sym}] accumulator ${pending:.2f} reaches min order "
+        f"size — attempting limit LONG @ {candle_low:.4f}"
     )
 
     oid = place_long(
@@ -1808,7 +2687,25 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     if oid == "SKIP" or oid is None:
         record_attempt_stat(sym, candle_low, success=False)
         record_lifetime_order_outcome(sym, success=False)
-        log.warning(f"[{sym}] placement unfulfilled — carrying accumulator forward")
+        # Accumulator is deliberately NOT reset here — it retains
+        # the order_size_usd that was just added above, so this
+        # failed attempt's amount carries forward into the next
+        # trigger's accumulation rather than being discarded. See
+        # FAILED-ORDER CARRY-FORWARD in the module docstring.
+        if oid == "SKIP":
+            log.warning(
+                f"[{sym}] fire skipped by place_long despite "
+                "passing pre-check — leaving accumulator intact "
+                f"(carries forward ${order_size_usd:.4f} from this "
+                "trigger)"
+            )
+        else:
+            log.error(
+                f"[{sym}] minute-trigger order rejected by MEXC — "
+                "leaving accumulator intact, will retry on next "
+                f"trigger (carries forward ${order_size_usd:.4f} "
+                "from this trigger)"
+            )
         return
 
     record_attempt_stat(sym, candle_low, success=True, usd_if_success=pending)
@@ -1832,13 +2729,20 @@ def run_minute_checks(now_utc: datetime.datetime):
         try:
             process_symbol_minute(sym, now_utc)
         except Exception as e:
-            log.error(f"[{sym}] minute check failed: {e}", exc_info=True)
+            log.error(
+                f"[{sym}] minute check failed: {e}",
+                exc_info=True
+            )
 
 
 # ── daily activity report ─────────────────────────────────────────────────────
 
-
 def build_daily_report_text(now_utc: datetime.datetime) -> str:
+    """Builds the plain-text daily activity report body. Iterates
+    every symbol currently configured in SYMBOLS — i.e. every
+    actively-monitored symbol, whether presently trading or flagged
+    FAILED — so the report always reflects the FULL active symbol
+    roster and never silently omits an entry."""
     window_start = None
 
     for sym in SYMBOLS:
@@ -1852,24 +2756,35 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
         window_start_dt = datetime.datetime.fromtimestamp(window_start, tz=UTC)
         header = (
             f"Daily Activity Report — "
-            f"{window_start_dt.strftime('%Y-%m-%d %H:%M')} UTC to {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+            f"{window_start_dt.strftime('%Y-%m-%d %H:%M')} UTC "
+            f"to {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
         )
     else:
-        header = f"Daily Activity Report — as of {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+        header = (
+            f"Daily Activity Report — as of "
+            f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
 
     contrib_date = get_contrib_last_computed_date()
     contrib_note = (
         f"Contribution weights last computed: {contrib_date.isoformat()}"
         if contrib_date is not None
-        else "Contribution weights: not yet computed"
+        else "Contribution weights: not yet computed (flat fallback in effect)"
     )
 
     active_count = sum(1 for sym in SYMBOLS if not is_failed(sym))
     failed_count_total = len(SYMBOLS) - active_count
-    roster_note = f"Symbols covered: {len(SYMBOLS)} total ({active_count} trading, {failed_count_total} failed/excluded)"
+
+    roster_note = (
+        f"Symbols covered: {len(SYMBOLS)} total "
+        f"({active_count} trading, {failed_count_total} failed/excluded)"
+    )
 
     lines = [header, contrib_note, roster_note, ""]
 
+    # Every symbol in SYMBOLS gets a line — active and failed alike —
+    # so the report always covers the full, current roster of
+    # actively-monitored symbols with no omissions.
     for sym in SYMBOLS:
         stats = get_daily_stats_snapshot(sym)
         triggers = stats["triggers"]
@@ -1879,16 +2794,26 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
         attempt_count = stats["attempt_count"]
         attempt_sum = stats["attempt_price_sum"]
 
-        avg_price = attempt_sum / attempt_count if attempt_count > 0 else None
-        avg_price_str = f"{avg_price:,.4f}" if avg_price is not None else "n/a"
+        avg_price = (
+            attempt_sum / attempt_count
+            if attempt_count > 0
+            else None
+        )
+
+        avg_price_str = (
+            f"{avg_price:,.4f}" if avg_price is not None else "n/a"
+        )
 
         excluded_note = " [EXCLUDED — not traded]" if is_failed(sym) else ""
         contrib = get_contrib_per_trigger_usd(sym)
 
         lines.append(
-            f"{sym}: triggers={triggers}  order_value=${order_value:,.2f}  "
-            f"ok={ok}  failed={failed_count}  avg_attempt_price={avg_price_str}  "
-            f"contrib/trigger=${contrib:.3f}{excluded_note}"
+            f"{sym}: triggers={triggers}  "
+            f"order_value=${order_value:,.2f}  "
+            f"ok={ok}  failed={failed_count}  "
+            f"avg_attempt_price={avg_price_str}  "
+            f"contrib/trigger=${contrib:.3f}"
+            f"{excluded_note}"
         )
 
     return "\n".join(lines)
@@ -1896,7 +2821,8 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
 
 def maybe_send_daily_report(now_utc: datetime.datetime):
     at_or_after_report_time = (
-        (now_utc.hour, now_utc.minute) >= (REPORT_HOUR_UTC, REPORT_MINUTE_UTC)
+        (now_utc.hour, now_utc.minute)
+        >= (REPORT_HOUR_UTC, REPORT_MINUTE_UTC)
     )
 
     if not at_or_after_report_time:
@@ -1921,11 +2847,13 @@ def maybe_send_daily_report(now_utc: datetime.datetime):
         set_last_report_sent_at(now_utc)
         reset_daily_stats_all(now_utc)
     else:
-        log.error("daily report send failed — will retry next minute")
+        log.error(
+            "daily report send failed — counters NOT reset, "
+            "will retry next minute"
+        )
 
 
 # ── startup test orders ───────────────────────────────────────────────────────
-
 
 def _open_test_order(sym: str) -> Optional[Dict]:
     if sym not in specs:
@@ -1934,434 +2862,827 @@ def _open_test_order(sym: str) -> Optional[Dict]:
     try:
         mark = get_mark(sym)
         if mark <= 0:
-            flag_failed(sym, f"invalid mark price ({mark}) at startup test")
+            flag_failed(
+                sym,
+                f"invalid mark price ({mark}) at startup test"
+            )
             return None
 
         test_price = mark * TEST_ORDER_DISCOUNT
         min_vol = _mos(sym)
 
         log.info(
-            f"[{sym}] test order OPEN: mark={mark:.4f} limit={test_price:.4f} "
-            f"vol={min_vol} leverage={_effective_leverage(sym)}x"
+            f"[{sym}] test order OPEN: "
+            f"mark={mark:.4f} "
+            f"limit={test_price:.4f} "
+            f"(-{(1 - TEST_ORDER_DISCOUNT) * 100:.0f}%) "
+            f"vol={min_vol} (exchange minimum) "
+            f"leverage={_effective_leverage(sym)}x"
         )
 
         oid = place_long_min_size(sym, test_price)
-        if not oid:
-            flag_failed(sym, "startup test order creation rejected by MEXC")
+
+        if oid is None:
+            flag_failed(sym, "test order rejected by MEXC")
             return None
 
-        return {"symbol": sym, "order_id": oid, "limit_price": test_price}
+        log.info(f"[{sym}] test order placed id={oid}")
+
+        return {
+            "sym": sym,
+            "oid": oid,
+            "limit_price": test_price,
+            "vol": min_vol,
+        }
+
     except Exception as e:
-        flag_failed(sym, f"exception during test order creation: {e}")
+        flag_failed(sym, f"exception during test order open: {e}")
+        log.error(f"[{sym}] test order open failed: {e}", exc_info=True)
         return None
 
 
+def _close_test_order(pending: Dict):
+    sym = pending["sym"]
+    oid = pending["oid"]
+
+    try:
+        if is_filled(sym, oid):
+            log.warning(
+                f"[{sym}] test order id={oid} FILLED during the "
+                f"{TEST_ORDER_WAIT_SEC}s wait. "
+                "This is now a real open long position. Symbol remains validated."
+            )
+            record_order({
+                "symbol": sym,
+                "timestamp": datetime.datetime.now(UTC).isoformat(),
+                "order_id": oid,
+                "kind": "startup_test_filled",
+                "limit_price": pending["limit_price"],
+                "vol": pending["vol"],
+            })
+            return
+
+        cancelled = cancel_order(sym, oid)
+
+        if cancelled:
+            log.info(f"[{sym}] test order id={oid} cancelled successfully — symbol validated")
+        else:
+            flag_failed(sym, f"test order id={oid} could not be cancelled")
+
+    except Exception as e:
+        flag_failed(sym, f"exception during test order close: {e}")
+        log.error(f"[{sym}] test order close failed: {e}", exc_info=True)
+
+
 def run_startup_test_orders():
-    log.info("=== STARTING BATCH TEST ORDERS FOR ALL SYMBOLS ===")
-    opened_orders = []
+    log.info(
+        f"══ startup test orders: {len(SYMBOLS)} symbols — "
+        f"phase 1/3: opening ══"
+    )
 
+    pending = []
     for sym in SYMBOLS:
-        if is_failed(sym):
-            continue
-        res = _open_test_order(sym)
-        if res:
-            opened_orders.append(res)
+        result = _open_test_order(sym)
+        if result is not None:
+            pending.append(result)
 
-    if not opened_orders:
-        log.info("No test orders opened.")
-        return
+    log.info(
+        f"══ startup test orders: {len(pending)}/{len(SYMBOLS)} "
+        f"opened — phase 2/3: waiting {TEST_ORDER_WAIT_SEC}s ══"
+    )
 
-    log.info(f"Waiting {TEST_ORDER_WAIT_SEC}s for test orders...")
     time.sleep(TEST_ORDER_WAIT_SEC)
 
-    log.info("=== CHECKING AND CANCELING STARTUP TEST ORDERS ===")
-    for item in opened_orders:
-        sym = item["symbol"]
-        oid = item["order_id"]
+    log.info("══ startup test orders: phase 3/3: closing ══")
 
-        if is_filled(sym, oid):
-            log.info(f"[{sym}] test order id={oid} FILLED during wait")
-        else:
-            cancel_ok = cancel_order(sym, oid)
-            if not cancel_ok:
-                flag_failed(sym, f"failed to cancel test order id={oid}")
-            else:
-                log.info(f"[{sym}] test order id={oid} successfully cancelled")
+    for p in pending:
+        _close_test_order(p)
 
-    log.info("=== STARTUP TEST ORDERS COMPLETE ===")
+    ok = [s for s in SYMBOLS if not is_failed(s)]
+    failed = [s for s in SYMBOLS if is_failed(s)]
+
+    log.info(
+        "══ startup test orders: all symbols done — "
+        f"{len(ok)} ok, {len(failed)} failed "
+        f"{failed if failed else ''} ══"
+    )
 
 
-# ── chart & overview rendering ────────────────────────────────────────────────
+# ── main overview SVG (tabular) ────────────────────────────────────────────────
 
+def _table_col_x(col_key: str) -> int:
+    x = TABLE_MARGIN
+    for key, _full in TABLE_COLUMNS:
+        if key == col_key:
+            return x
+        x += TABLE_COL_W[key]
+    return x
+
+
+def _avg_entry_price(sym: str) -> Optional[float]:
+    orders = executed_orders_for_sym(sym)
+    if not orders:
+        return None
+    total = sum(float(o.get("limit_price", 0.0)) for o in orders)
+    return total / len(orders)
+
+
+def _total_exposure_usd(sym: str) -> float:
+    """Cumulative USD notional (unlevered) across every executed
+    order for this symbol, lifetime. Uses the 'usd' field recorded
+    on each real order (the accumulated amount actually submitted),
+    NOT multiplied by leverage."""
+    orders = executed_orders_for_sym(sym)
+    return sum(float(o.get("usd", 0.0)) for o in orders)
+
+
+def render_svg(now_utc: datetime.datetime) -> str:
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    contrib_date = get_contrib_last_computed_date()
+    contrib_date_str = (
+        contrib_date.isoformat() if contrib_date is not None else "pending"
+    )
+
+    n_rows = len(SYMBOLS)
+    table_h = (
+        TABLE_TITLE_H + TABLE_LEGEND_H + TABLE_HEADER_H
+        + n_rows * TABLE_ROW_H + TABLE_MARGIN
+    )
+    W = TABLE_W
+    H = table_h
+
+    title_text = _xml_escape(
+        f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
+        f'minute-trigger engine — {now_str} — '
+        f'contrib weights: {contrib_date_str}'
+    )
+
+    legend_text = _xml_escape(
+        "  ".join(f"{abbr}={full}" for abbr, full in TABLE_COLUMNS)
+    )
+
+    svg = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {W} {H}" '
+            f'width="100%" '
+            f'style="max-width:{W}px;display:block">'
+        ),
+        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
+        (
+            f'<text x="{TABLE_MARGIN}" y="20" '
+            f'font-family="Courier New" '
+            f'font-size="13" '
+            f'fill="#000000" '
+            f'font-weight="bold">'
+            f'{title_text}'
+            f'</text>'
+        ),
+        (
+            f'<text x="{TABLE_MARGIN}" y="{TABLE_TITLE_H + 16}" '
+            f'font-family="Courier New" '
+            f'font-size="9" '
+            f'fill="#000000">'
+            f'{legend_text}'
+            f'</text>'
+        ),
+    ]
+
+    grid_top = TABLE_TITLE_H + TABLE_LEGEND_H
+    header_y = grid_top + TABLE_HEADER_H - 8
+
+    # Header row
+    svg.append(
+        f'<rect x="{TABLE_MARGIN}" y="{grid_top}" '
+        f'width="{W - TABLE_MARGIN * 2}" height="{TABLE_HEADER_H}" '
+        f'fill="#f0f0f0" stroke="#999999" stroke-width="1"/>'
+    )
+
+    for abbr, _full in TABLE_COLUMNS:
+        x = _table_col_x(abbr)
+        svg.append(
+            f'<text x="{x + 6}" y="{header_y}" '
+            f'font-family="Courier New" font-size="11" '
+            f'fill="#000000" font-weight="bold">'
+            f'{_xml_escape(abbr)}</text>'
+        )
+
+    # Body rows
+    for i, sym in enumerate(SYMBOLS):
+        row_y = grid_top + TABLE_HEADER_H + i * TABLE_ROW_H
+        text_y = row_y + TABLE_ROW_H - 8
+
+        svg.append(
+            f'<rect x="{TABLE_MARGIN}" y="{row_y}" '
+            f'width="{W - TABLE_MARGIN * 2}" height="{TABLE_ROW_H}" '
+            f'fill="#ffffff" stroke="#dddddd" stroke-width="1"/>'
+        )
+
+        failed = is_failed(sym)
+        trg = get_trigger_count(sym)
+        ctb = get_contrib_per_trigger_usd(sym)
+        bud_r = get_budget_r(sym)
+        mos = _mos(sym)
+        acc = get_accumulator(sym)
+        avg_entry = _avg_entry_price(sym)
+        exec_ok, exec_failed = get_lifetime_order_counts(sym)
+        exposure = _total_exposure_usd(sym)
+
+        sym_display = f"{sym}[F]" if failed else sym
+
+        values = {
+            "Sym":    sym_display,
+            "Trg":    f"{trg}",
+            "Ctb":    f"{ctb:,.3f}",
+            "BudR":   f"{bud_r:,.2f}",
+            "MOS":    f"{mos:,.4f}",
+            "Acc":    f"{acc:,.2f}",
+            "AvgEnt": (f"{avg_entry:,.4f}" if avg_entry is not None else "n/a"),
+            "Exec":   f"{exec_ok}",
+            "Fail":   f"{exec_failed}",
+            "Exp":    f"{exposure:,.2f}",
+        }
+
+        for abbr, _full in TABLE_COLUMNS:
+            x = _table_col_x(abbr)
+            svg.append(
+                f'<text x="{x + 6}" y="{text_y}" '
+                f'font-family="Courier New" font-size="10" '
+                f'fill="#000000">'
+                f'{_xml_escape(values[abbr])}</text>'
+            )
+
+    # Column separators
+    x = TABLE_MARGIN
+    for abbr, _full in TABLE_COLUMNS:
+        svg.append(
+            f'<line x1="{x}" y1="{grid_top}" '
+            f'x2="{x}" y2="{grid_top + TABLE_HEADER_H + n_rows * TABLE_ROW_H}" '
+            f'stroke="#cccccc" stroke-width="1"/>'
+        )
+        x += TABLE_COL_W[abbr]
+    svg.append(
+        f'<line x1="{x}" y1="{grid_top}" '
+        f'x2="{x}" y2="{grid_top + TABLE_HEADER_H + n_rows * TABLE_ROW_H}" '
+        f'stroke="#999999" stroke-width="1"/>'
+    )
+
+    svg.append("</svg>")
+    return "\n".join(svg)
+
+
+# ── per-symbol chart SVG ───────────────────────────────────────────────────────
 
 def render_symbol_chart_svg(sym: str) -> str:
     buf = MINUTE_BUFFERS[sym]
-    bars = buf.snapshot()
-    if not bars:
+    bars_1m = buf.snapshot()
+
+    now_s = int(time.time())
+    cutoff = now_s - CHART_MINUTES * 60
+
+    bars_1m = [b for b in bars_1m if b["t"] >= cutoff]
+    candles = resample_ohlc(bars_1m, CHART_RESAMPLE_MIN)
+
+    if not candles:
         return (
-            f"<svg xmlns='http://www.w3.org/2000/svg' width='{CHART_W}' height='{CHART_H}'>"
-            f"<text x='20' y='30' fill='#000000' font-family='Courier New'>No chart data for {_xml_escape(sym)}</text>"
-            f"</svg>"
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'width="{CHART_W}" height="{CHART_H}">'
+            f'<rect width="{CHART_W}" height="{CHART_H}" fill="#fafafa"/>'
+            f'<text x="20" y="40" font-family="Courier New" '
+            f'font-size="14" fill="#888">'
+            f'{sym}: no chart data yet</text></svg>'
         )
 
-    resampled = resample_ohlc(bars, CHART_RESAMPLE_MIN)
-    if not resampled:
-        return (
-            f"<svg xmlns='http://www.w3.org/2000/svg' width='{CHART_W}' height='{CHART_H}'>"
-            f"<text x='20' y='30' fill='#000000' font-family='Courier New'>No resampled data for {_xml_escape(sym)}</text>"
-            f"</svg>"
-        )
+    failed = is_failed(sym)
+    budget = get_budget(sym)
+    contrib = get_contrib_per_trigger_usd(sym)
 
-    lows = [b["l"] for b in resampled]
-    highs = [b["h"] for b in resampled]
-    min_p = min(lows)
-    max_p = max(highs)
-    if min_p == max_p:
-        min_p -= 1.0
-        max_p += 1.0
-    p_range = max_p - min_p
+    ref_window = ROLL_MINUTES_SHORT if budget >= 0 else ROLL_MINUTES_LONG
+    ref_label = "2d" if budget >= 0 else "9d"
+    ref_low = buf.rolling_low(ref_window)
+
+    lo = min(c["l"] for c in candles)
+    hi = max(c["h"] for c in candles)
+
+    if ref_low is not None:
+        lo = min(lo, ref_low)
+        hi = max(hi, ref_low)
+
+    span = (hi - lo) or 1.0
+
+    lo -= span * 0.05
+    hi += span * 0.05
+    span = hi - lo
 
     plot_w = CHART_W - CHART_MARGIN_L - CHART_MARGIN_R
     plot_h = CHART_H - CHART_MARGIN_T - CHART_MARGIN_B
 
-    def y_coord(price: float) -> float:
-        return CHART_MARGIN_T + plot_h * (1.0 - (price - min_p) / p_range)
+    t0 = candles[0]["t"]
+    t1 = candles[-1]["t"] + CHART_RESAMPLE_MIN * 60
+    t_span = (t1 - t0) or 1
 
-    n_candles = len(resampled)
-    candle_w = max(1.0, (plot_w / max(n_candles, 1)) * 0.7)
-    step_w = plot_w / max(n_candles, 1)
+    def x_of(t: int) -> float:
+        return CHART_MARGIN_L + (t - t0) / t_span * plot_w
 
-    elements = []
-    elements.append(f"<rect width='{CHART_W}' height='{CHART_H}' fill='#ffffff'/>")
+    def y_of(price: float) -> float:
+        return CHART_MARGIN_T + (hi - price) / span * plot_h
 
-    budget = get_budget(sym)
-    ref_win = ROLL_MINUTES_SHORT if budget >= 0 else ROLL_MINUTES_LONG
-    ref_label = "2d" if budget >= 0 else "9d"
-    ref_low = buf.rolling_low(ref_win, exclude_latest=False)
-    ref_str = f"{ref_low:.4f}" if ref_low is not None else "n/a"
-    failed_str = " [FAILED]" if is_failed(sym) else ""
+    now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
-    title_text = (
-        f"{_xml_escape(sym)}{failed_str} — 15m Resampled ({CHART_MINUTES // 1440}d) | "
-        f"Budget: ${budget:.2f} | {ref_label} Ref Low: {ref_str}"
-    )
-    elements.append(
-        f"<text x='{CHART_MARGIN_L}' y='24' font-family='Courier New' "
-        f"font-size='14' font-weight='bold' fill='#000000'>{title_text}</text>"
+    title_suffix = _xml_escape(
+        (" [FAILED — excluded from trading]" if failed else "")
+        + f" [contrib: ${contrib:.3f}/trigger]"
+        + f" [lev: {_effective_leverage(sym)}x]"
     )
 
-    y_ticks = 5
-    for i in range(y_ticks + 1):
-        price_val = min_p + (p_range * i / y_ticks)
-        y = y_coord(price_val)
-        elements.append(
-            f"<line x1='{CHART_MARGIN_L}' y1='{y:.1f}' x2='{CHART_W - CHART_MARGIN_R}' y2='{y:.1f}' "
-            f"stroke='#e0e0e0' stroke-width='1'/>"
-        )
-        elements.append(
-            f"<text x='{CHART_MARGIN_L - 8}' y='{y + 4:.1f}' font-family='Courier New' "
-            f"font-size='10' fill='#555555' text-anchor='end'>{price_val:.4f}</text>"
-        )
+    svg = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {CHART_W} {CHART_H}" '
+            f'width="100%" style="max-width:{CHART_W}px;display:block">'
+        ),
+        f'<rect width="{CHART_W}" height="{CHART_H}" fill="#fafafa"/>',
+        (
+            f'<text x="{CHART_MARGIN_L}" y="20" '
+            f'font-family="Courier New" font-size="13" '
+            f'fill="{"#cc0000" if failed else "#333"}" font-weight="bold">'
+            f'{sym} — 10d, 15m candles — {now_str}{title_suffix}</text>'
+        ),
+    ]
 
-    if ref_low is not None and min_p <= ref_low <= max_p:
-        ref_y = y_coord(ref_low)
-        elements.append(
-            f"<line x1='{CHART_MARGIN_L}' y1='{ref_y:.1f}' x2='{CHART_W - CHART_MARGIN_R}' y2='{ref_y:.1f}' "
-            f"stroke='#0000ff' stroke-width='1.5' stroke-dasharray='4,4'/>"
+    for i in range(6):
+        price = lo + span * i / 5
+        y = y_of(price)
+
+        svg.append(
+            f'<line x1="{CHART_MARGIN_L}" y1="{y:.1f}" '
+            f'x2="{CHART_W - CHART_MARGIN_R}" y2="{y:.1f}" '
+            f'stroke="#e0e0e0" stroke-width="1"/>'
         )
 
-    for idx, b in enumerate(resampled):
-        cx = CHART_MARGIN_L + idx * step_w + step_w / 2.0
-        yo = y_coord(b["o"])
-        yh = y_coord(b["h"])
-        yl = y_coord(b["l"])
-        yc = y_coord(b["c"])
-
-        color = "#2e7d32" if b["c"] >= b["o"] else "#c62828"
-
-        elements.append(
-            f"<line x1='{cx:.1f}' y1='{yh:.1f}' x2='{cx:.1f}' y2='{yl:.1f}' "
-            f"stroke='{color}' stroke-width='1'/>"
-        )
-        body_top = min(yo, yc)
-        body_h = max(abs(yc - yo), 1.0)
-        elements.append(
-            f"<rect x='{cx - candle_w / 2.0:.1f}' y='{body_top:.1f}' "
-            f"width='{candle_w:.1f}' height='{body_h:.1f}' fill='{color}'/>"
+        svg.append(
+            f'<text x="4" y="{y + 4:.1f}" '
+            f'font-family="Courier New" font-size="9" '
+            f'fill="#888">{_xml_escape(f"{price:,.3f}")}</text>'
         )
 
-    with _STATE_DATA_LOCK:
-        triggers_for_sym = [t for t in STATE_DATA["triggers"] if t.get("symbol") == sym]
-        orders_for_sym = [o for o in STATE_DATA["orders"] if o.get("symbol") == sym and "reference_window" in o]
+    if ref_low is not None:
+        ry = y_of(ref_low)
 
-    res_ts = [b["t"] for b in resampled]
-    min_chart_ts = res_ts[0] if res_ts else 0
-    max_chart_ts = res_ts[-1] + CHART_RESAMPLE_MIN * 60 if res_ts else 0
-
-    for trg in triggers_for_sym:
-        t_ts = _safe_ts(trg.get("candle_time"))
-        t_price = float(trg.get("price", 0))
-        if t_ts and min_chart_ts <= t_ts <= max_chart_ts and t_price:
-            frac = (t_ts - min_chart_ts) / max(max_chart_ts - min_chart_ts, 1)
-            cx = CHART_MARGIN_L + frac * plot_w
-            cy = y_coord(t_price)
-            elements.append(
-                f"<line x1='{cx - 4:.1f}' y1='{cy:.1f}' x2='{cx + 4:.1f}' y2='{cy:.1f}' "
-                f"stroke='#ff6d00' stroke-width='2'/>"
-            )
-
-    for ord_rec in orders_for_sym:
-        o_ts = _safe_ts(ord_rec.get("candle_time")) or _safe_ts(ord_rec.get("timestamp"))
-        o_price = float(ord_rec.get("limit_price", 0))
-        if o_ts and min_chart_ts <= o_ts <= max_chart_ts and o_price:
-            frac = (o_ts - min_chart_ts) / max(max_chart_ts - min_chart_ts, 1)
-            cx = CHART_MARGIN_L + frac * plot_w
-            cy = y_coord(o_price)
-            elements.append(
-                f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='4' fill='#2962ff' stroke='#ffffff' stroke-width='1'/>"
-            )
-
-    svg_content = "\n".join(elements)
-    return (
-        f"<svg xmlns='http://www.w3.org/2000/svg' width='{CHART_W}' height='{CHART_H}'>\n"
-        f"{svg_content}\n"
-        f"</svg>"
-    )
-
-
-def render_svg() -> str:
-    num_rows = len(SYMBOLS)
-    total_h = (
-        TABLE_TITLE_H
-        + TABLE_LEGEND_H
-        + TABLE_HEADER_H
-        + num_rows * TABLE_ROW_H
-        + TABLE_MARGIN * 2
-    )
-
-    now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    elements = []
-    elements.append(
-        f"<rect width='{TABLE_W}' height='{total_h}' fill='#ffffff'/>"
-    )
-
-    title_y = TABLE_MARGIN + 20
-    elements.append(
-        f"<text x='{TABLE_MARGIN}' y='{title_y}' font-family='Courier New, monospace' "
-        f"font-size='16' font-weight='bold' fill='#000000'>"
-        f"MultiLongDCA Bot Overview — {now_str}</text>"
-    )
-
-    legend_y = title_y + TABLE_LEGEND_H - 10
-    legend_str = " | ".join(f"{abbr}:{full}" for abbr, full in TABLE_COLUMNS)
-    elements.append(
-        f"<text x='{TABLE_MARGIN}' y='{legend_y}' font-family='Courier New, monospace' "
-        f"font-size='11' fill='#333333'>{_xml_escape(legend_str)}</text>"
-    )
-
-    table_top_y = title_y + TABLE_LEGEND_H
-
-    elements.append(
-        f"<rect x='{TABLE_MARGIN}' y='{table_top_y}' width='{sum(TABLE_COL_W.values())}' "
-        f"height='{TABLE_HEADER_H}' fill='#f0f0f0' stroke='#cccccc' stroke-width='1'/>"
-    )
-
-    curr_x = TABLE_MARGIN
-    for abbr, _ in TABLE_COLUMNS:
-        col_w = TABLE_COL_W[abbr]
-        elements.append(
-            f"<text x='{curr_x + 6}' y='{table_top_y + 18}' font-family='Courier New, monospace' "
-            f"font-size='12' font-weight='bold' fill='#000000'>{abbr}</text>"
-        )
-        curr_x += col_w
-
-    row_top = table_top_y + TABLE_HEADER_H
-    for idx, sym in enumerate(SYMBOLS):
-        y_pos = row_top + idx * TABLE_ROW_H
-
-        elements.append(
-            f"<rect x='{TABLE_MARGIN}' y='{y_pos}' width='{sum(TABLE_COL_W.values())}' "
-            f"height='{TABLE_ROW_H}' fill='#ffffff' stroke='#e0e0e0' stroke-width='1'/>"
+        svg.append(
+            f'<line x1="{CHART_MARGIN_L}" y1="{ry:.1f}" '
+            f'x2="{CHART_W - CHART_MARGIN_R}" y2="{ry:.1f}" '
+            f'stroke="#cc0000" stroke-width="1.2" '
+            f'stroke-dasharray="6,3"/>'
         )
 
-        failed = is_failed(sym)
-        sym_disp = f"{sym}[F]" if failed else sym
-        trg = get_trigger_count(sym)
-        ctb = get_contrib_per_trigger_usd(sym)
-        bud_r = get_budget_r(sym)
-        mos_val = _mos(sym)
-        acc = get_accumulator(sym)
+        svg.append(
+            f'<text x="{CHART_W - CHART_MARGIN_R - 4}" y="{ry - 4:.1f}" '
+            f'font-family="Courier New" font-size="10" '
+            f'fill="#cc0000" text-anchor="end">'
+            f'{_xml_escape(f"{ref_label} low threshold: {ref_low:,.4f}")}</text>'
+        )
 
-        exec_orders = executed_orders_for_sym(sym)
-        exec_cnt_hist, fail_cnt_hist = get_lifetime_order_counts(sym)
+    candle_px_w = max(1.5, plot_w / len(candles) * 0.7)
 
-        if exec_orders:
-            avg_p = sum(float(o.get("limit_price", 0)) for o in exec_orders) / len(exec_orders)
-            avg_p_str = f"${avg_p:.4f}"
-            exp_val = sum(float(o.get("usd", 0)) for o in exec_orders)
-            exp_str = f"${exp_val:.2f}"
-        else:
-            avg_p_str = "n/a"
-            exp_str = "$0.00"
+    for c in candles:
+        x = x_of(c["t"]) + (plot_w / len(candles)) / 2
 
-        cell_values = {
-            "Sym":    sym_disp,
-            "Trg":    str(trg),
-            "Ctb":    f"${ctb:.3f}",
-            "BudR":   f"${bud_r:.2f}",
-            "MOS":    f"{mos_val:g}",
-            "Acc":    f"${acc:.2f}",
-            "AvgEnt": avg_p_str,
-            "Exec":   str(exec_cnt_hist),
-            "Fail":   str(fail_cnt_hist),
-            "Exp":    exp_str,
-        }
+        up = c["c"] >= c["o"]
+        color = "#1a8a1a" if up else "#cc2200"
 
-        curr_x = TABLE_MARGIN
-        for abbr, _ in TABLE_COLUMNS:
-            col_w = TABLE_COL_W[abbr]
-            val = cell_values[abbr]
+        y_high = y_of(c["h"])
+        y_low = y_of(c["l"])
+        y_open = y_of(c["o"])
+        y_close = y_of(c["c"])
 
-            if abbr == "Sym":
-                elements.append(
-                    f"<a href='/chart/{sym}.svg'>"
-                    f"<text x='{curr_x + 6}' y='{y_pos + 18}' font-family='Courier New, monospace' "
-                    f"font-size='12' fill='#000000' text-decoration='underline'>{_xml_escape(val)}</text>"
-                    f"</a>"
-                )
-            else:
-                elements.append(
-                    f"<text x='{curr_x + 6}' y='{y_pos + 18}' font-family='Courier New, monospace' "
-                    f"font-size='12' fill='#000000'>{_xml_escape(val)}</text>"
-                )
-            curr_x += col_w
+        body_top = min(y_open, y_close)
+        body_h = max(1.0, abs(y_close - y_open))
 
-    svg_body = "\n".join(elements)
-    return (
-        f"<svg xmlns='http://www.w3.org/2000/svg' width='{TABLE_W}' height='{total_h}'>\n"
-        f"{svg_body}\n"
-        f"</svg>"
+        svg.append(
+            f'<line x1="{x:.1f}" y1="{y_high:.1f}" '
+            f'x2="{x:.1f}" y2="{y_low:.1f}" '
+            f'stroke="{color}" stroke-width="1"/>'
+        )
+
+        svg.append(
+            f'<rect x="{x - candle_px_w / 2:.1f}" y="{body_top:.1f}" '
+            f'width="{candle_px_w:.1f}" height="{body_h:.1f}" '
+            f'fill="{color}"/>'
+        )
+
+    trigger_markers = [
+        t for t in STATE_DATA["triggers"]
+        if t.get("symbol") == sym
+    ]
+
+    for t in trigger_markers:
+        ts = _safe_ts(t.get("candle_time"))
+
+        if ts is None or ts < t0 or ts > t1:
+            continue
+
+        tx = x_of(int(ts))
+        ty = y_of(t["price"])
+        sz = 3.5
+
+        svg.append(
+            f'<line x1="{tx - sz:.1f}" y1="{ty - sz:.1f}" '
+            f'x2="{tx + sz:.1f}" y2="{ty + sz:.1f}" '
+            f'stroke="#7a3fb8" stroke-width="1.3"/>'
+        )
+
+        svg.append(
+            f'<line x1="{tx - sz:.1f}" y1="{ty + sz:.1f}" '
+            f'x2="{tx + sz:.1f}" y2="{ty - sz:.1f}" '
+            f'stroke="#7a3fb8" stroke-width="1.3"/>'
+        )
+
+    orders = [
+        o for o in STATE_DATA["orders"]
+        if o.get("symbol") == sym
+        and "limit_price" in o
+        and ("candle_time" in o or "timestamp" in o)
+    ]
+
+    for o in orders:
+        ts_str = o.get("candle_time") or o.get("timestamp")
+        ts = _safe_ts(ts_str)
+
+        if ts is None or ts < t0 or ts > t1:
+            continue
+
+        ox = x_of(int(ts))
+        oy = y_of(o["limit_price"])
+
+        is_real_fire = "reference_window" in o
+        marker_color = "#0044cc" if is_real_fire else "#888"
+
+        svg.append(
+            f'<circle cx="{ox:.1f}" cy="{oy:.1f}" r="4" '
+            f'fill="{marker_color}" stroke="#fff" stroke-width="1"/>'
+        )
+
+    legend_y = CHART_H - 8
+
+    svg.append(
+        f'<line x1="{CHART_MARGIN_L}" y1="{legend_y - 4}" '
+        f'x2="{CHART_MARGIN_L + 8}" y2="{legend_y + 4}" '
+        f'stroke="#7a3fb8" stroke-width="1.3"/>'
+    )
+    svg.append(
+        f'<line x1="{CHART_MARGIN_L}" y1="{legend_y + 4}" '
+        f'x2="{CHART_MARGIN_L + 8}" y2="{legend_y - 4}" '
+        f'stroke="#7a3fb8" stroke-width="1.3"/>'
+    )
+    svg.append(
+        f'<text x="{CHART_MARGIN_L + 14}" y="{legend_y + 4}" '
+        f'font-family="Courier New" font-size="10" fill="#555">'
+        f'trigger</text>'
     )
 
+    svg.append(
+        f'<circle cx="{CHART_MARGIN_L + 90}" cy="{legend_y}" r="4" '
+        f'fill="#0044cc" stroke="#fff" stroke-width="1"/>'
+    )
+    svg.append(
+        f'<text x="{CHART_MARGIN_L + 100}" y="{legend_y + 4}" '
+        f'font-family="Courier New" font-size="10" fill="#555">'
+        f'order placed</text>'
+    )
 
-# ── HTTP request handler ──────────────────────────────────────────────────────
+    svg.append(
+        f'<rect x="{CHART_MARGIN_L}" y="{CHART_MARGIN_T}" '
+        f'width="{plot_w}" height="{plot_h}" '
+        f'fill="none" stroke="#999" stroke-width="1"/>'
+    )
 
-
-class RequestHandler(http.server.BaseHTTPRequestHandler):
-
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-
-        if path in ("/", "/chart.svg"):
-            content = STATE.get_svg().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
-
-        elif path.startswith("/chart/"):
-            sym = path[7:].rstrip(".svg")
-            if sym in SYMBOLS:
-                content = STATE.get_chart_svg(sym).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
-                self.send_header("Content-Length", str(len(content)))
-                self.end_headers()
-                self.wfile.write(content)
-            else:
-                self.send_error(404, "Symbol not found")
-
-        elif path == "/health":
-            body = json.dumps({"status": STATE.get_status()}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        else:
-            self.send_error(404, "Not Found")
-
-    def log_message(self, format, *args):
-        pass
+    svg.append("</svg>")
+    return "\n".join(svg)
 
 
-def run_http_server():
-    server_address = (HTTP_HOST, HTTP_PORT)
-    httpd = http.server.HTTPServer(server_address, RequestHandler)
-    log.info(f"HTTP server running on {HTTP_HOST}:{HTTP_PORT}")
-    httpd.serve_forever()
+# ── engine timing ─────────────────────────────────────────────────────────────
+
+def _seconds_until_next_minute_mark() -> float:
+    now = time.time()
+    next_mark = (
+        (int(now) // 60 + 1) * 60
+        + MINUTE_CHECK_SECOND
+    )
+    return next_mark - now
 
 
-# ── main engine loop ──────────────────────────────────────────────────────────
+# ── engine cycle ─────────────────────────────────────────────────────────────
 
+def engine_cycle():
+    now_utc = datetime.datetime.now(UTC)
 
-def update_all_charts():
     try:
-        main_svg = render_svg()
-        STATE.set_svg(main_svg)
+        recompute_contributions_if_due(now_utc.date())
     except Exception as e:
-        log.error(f"failed to render main overview SVG: {e}")
+        log.error(
+            f"contribution-weighting recompute check failed: {e}",
+            exc_info=True
+        )
+
+    run_minute_checks(now_utc)
+
+    svg = render_svg(now_utc)
+    STATE.set_svg(svg)
 
     for sym in SYMBOLS:
         try:
             chart_svg = render_symbol_chart_svg(sym)
             STATE.set_chart_svg(sym, chart_svg)
         except Exception as e:
-            log.error(f"failed to render chart SVG for {sym}: {e}")
+            log.error(
+                f"[{sym}] chart render failed: {e}",
+                exc_info=True
+            )
+
+    try:
+        maybe_send_daily_report(now_utc)
+    except Exception as e:
+        log.error(
+            f"daily report check failed: {e}",
+            exc_info=True
+        )
+
+    n_orders = total_orders_count()
+    n_failed = len(FAILED_SYMBOLS)
+
+    STATE.set_status(
+        f"ok  "
+        f"{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}  "
+        f"total_orders={n_orders}  "
+        f"failed_symbols={n_failed}"
+    )
 
 
-def main_loop():
-    STATE.set_status("starting")
+# ── engine ────────────────────────────────────────────────────────────────────
 
-    log.info("Loading MEXC contract specifications...")
+def run_engine():
     load_specs()
 
-    for sym in SYMBOLS:
-        init_budget_r_if_absent(sym)
+    now_utc = datetime.datetime.now(UTC)
+    log.info("recomputing contribution weights on startup")
+    try:
+        recompute_contributions_if_due(now_utc.date(), force=True)
+    except Exception as e:
+        log.error(
+            f"startup contribution recompute failed: {e}",
+            exc_info=True
+        )
 
-    log.info("Seeding 1-minute OHLC buffers for all symbols...")
+    log.info("initializing BudgetR for any symbol without existing state")
+    for sym in SYMBOLS:
+        try:
+            init_budget_r_if_absent(sym)
+        except Exception as e:
+            log.error(
+                f"[{sym}] BudgetR initialization failed: {e}",
+                exc_info=True
+            )
+
+    run_startup_test_orders()
+
+    log.info(
+        "seeding 1-minute candle buffers for ALL symbols "
+        f"(including failed) (~{BUFFER_MAX_MINUTES} minutes each)"
+    )
+
     for sym in SYMBOLS:
         try:
             seed_minute_buffer(sym)
         except Exception as e:
-            log.error(f"[{sym}] buffer seeding failed: {e}")
+            log.error(
+                f"[{sym}] failed to seed minute buffer: {e}",
+                exc_info=True
+            )
 
-    today = datetime.datetime.now(UTC).date()
-    recompute_contributions_if_due(today)
+    log.info("engine starting — running initial cycle")
 
-    log.info("Running startup test orders...")
-    run_startup_test_orders()
-
-    STATE.set_status("running")
-    log.info("Entering minute-trigger engine main loop...")
-
-    update_all_charts()
+    try:
+        engine_cycle()
+    except Exception as e:
+        log.error(
+            f"initial engine cycle failed: {e}",
+            exc_info=True
+        )
+        STATE.set_status(f"error: {e}")
 
     while True:
+        wait_s = _seconds_until_next_minute_mark()
+        time.sleep(max(0, wait_s))
+
         try:
-            now_utc = datetime.datetime.now(UTC)
-
-            if now_utc.second == MINUTE_CHECK_SECOND:
-                recompute_contributions_if_due(now_utc.date())
-                run_minute_checks(now_utc)
-                maybe_send_daily_report(now_utc)
-                update_all_charts()
-
-                time.sleep(1.0)
-            else:
-                time.sleep(0.2)
-
+            engine_cycle()
         except Exception as e:
-            log.error(f"Error in main loop: {e}", exc_info=True)
-            time.sleep(1.0)
+            log.error(
+                f"engine cycle failed: {e}",
+                exc_info=True
+            )
+            STATE.set_status(f"error: {e}")
+
+
+# ── HTTP server ───────────────────────────────────────────────────────────────
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/chart.svg":
+            svg = STATE.get_svg().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(svg)
+
+        elif self.path.startswith("/chart/") and self.path.endswith(".svg"):
+            sym = self.path[len("/chart/"):-len(".svg")]
+
+            if sym not in SYMBOLS:
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            svg = STATE.get_chart_svg(sym).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(svg)
+
+        elif self.path == "/orders.json":
+            body = json.dumps(
+                STATE_DATA["orders"], indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/failed.json":
+            body = json.dumps(
+                sorted(FAILED_SYMBOLS), indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/budget.json":
+            body = json.dumps(
+                {
+                    "budget": STATE_DATA["budget"],
+                    "budget_r": STATE_DATA["budget_r"],
+                    "accumulator": STATE_DATA["accumulator"],
+                    "contrib_per_trigger_usd": STATE_DATA["contrib_per_trigger_usd"],
+                    "contrib_last_computed_date": STATE_DATA["contrib_last_computed_date"],
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/stats.json":
+            body = json.dumps(
+                {
+                    sym: get_daily_stats_snapshot(sym)
+                    for sym in SYMBOLS
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/leverage.json":
+            body = json.dumps(
+                {
+                    sym: {
+                        "global_leverage": LEVERAGE,
+                        "max_leverage": specs.get(sym, {}).get("max_lev"),
+                        "effective_leverage": _effective_leverage(sym),
+                    }
+                    for sym in SYMBOLS
+                },
+                indent=2
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path in ("/", ""):
+            status = STATE.get_status()
+
+            chart_links = " · ".join(
+                (
+                    f'<a href="/chart/{sym}.svg" target="_blank">'
+                    f'{sym}{" (failed)" if is_failed(sym) else ""}'
+                    f'</a>'
+                )
+                for sym in SYMBOLS
+            )
+
+            html = (
+                "<!doctype html>"
+                "<html>"
+                "<head>"
+                "<meta charset='utf-8'>"
+                "<meta http-equiv='refresh' content='60'>"
+                "<title>MultiLongDCA-Bot Overview</title>"
+                "<style>"
+                "body{font-family:monospace;"
+                "background:#fafafa;margin:24px}"
+                "img{max-width:100%;height:auto;"
+                "border:1px solid #ccc}"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<h3>"
+                "MultiLongDCA-Bot — "
+                "Multi-Symbol Minute-Trigger DCA Long Bot"
+                "</h3>"
+                f"<p>status: {status}</p>"
+                "<img src='/chart.svg' "
+                "alt='overview table'/>"
+                f"<p>charts: {chart_links}</p>"
+                "<p>"
+                "<a href='/orders.json'>order records</a>"
+                " · "
+                "<a href='/budget.json'>budget/accumulator/contribution</a>"
+                " · "
+                "<a href='/stats.json'>current stats</a>"
+                " · "
+                "<a href='/leverage.json'>leverage per symbol</a>"
+                " · "
+                "<a href='/failed.json'>failed symbols</a>"
+                "</p>"
+                "</body>"
+                "</html>"
+            )
+
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+# ── HTTP server thread ────────────────────────────────────────────────────────
+
+def run_server():
+    server = http.server.ThreadingHTTPServer(
+        (HTTP_HOST, HTTP_PORT),
+        Handler
+    )
+    log.info(f"server listening on {HTTP_HOST}:{HTTP_PORT}")
+    server.serve_forever()
+
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
+def main():
+    if not MEXC_KEY or not MEXC_SECRET:
+        log.error("MEXC / MEXCSECRET not set")
+        raise SystemExit(1)
+
+    server_thread = threading.Thread(
+        target=run_server,
+        daemon=True
+    )
+    server_thread.start()
+
+    run_engine()
 
 
 if __name__ == "__main__":
-    server_thread = threading.Thread(target=run_http_server, daemon=True)
-    server_thread.start()
-
-    main_loop()
+    main()
