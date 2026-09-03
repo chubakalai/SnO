@@ -68,7 +68,11 @@ Rolling 1-minute OHLC candle buffer (per symbol):
     candle(s) and appending them, for every symbol regardless of
     failed status.
   - Powers both the trigger-reference lows AND the 15m-resampled
-    10-day chart (see CHARTS below).
+    10-day chart (see CHARTS below), AND the overview table's
+    dollar-denominated MOS column (see MAIN OVERVIEW TABLE below),
+    which reuses each symbol's most recently closed 1-minute close
+    already resident in the buffer rather than issuing a live mark-
+    price fetch, so rendering the table adds no network calls.
 
 ═══════════════════════════════════════════════════════════════════
 STRICT NEW-LOW SEMANTICS
@@ -107,7 +111,10 @@ BudgetR is a second, distinct per-symbol running figure (separate
 from the running budget described above) whose sole purpose is to
 feed the order-sizing formula (see ORDER SIZING below). It is
 tracked for EVERY symbol, failed or not, so that a symbol which is
-later un-flagged or inspected retains a consistent history.
+later un-flagged or inspected retains a consistent history. It is,
+and always has been, USD-denominated throughout — it derives
+entirely from the USD running budget and is never scaled by
+contract size, contract count, or price.
 
   - INITIALIZATION: on process startup, for every symbol that does
     not already have a BudgetR value in persisted state (i.e. first
@@ -416,14 +423,31 @@ trading logic runs, so chart rendering never delays order placement.
 Served at /chart/<SYMBOL>.svg and linked from the main overview page
 for every symbol, failed or not.
 
+This is the ONLY remaining SVG-based visual in the bot. The main
+overview table (below) was formerly also SVG-rendered but has been
+converted to a native HTML table — see MAIN OVERVIEW TABLE — since
+a bordered grid of text cells has no need of vector graphics
+machinery; genuine candlestick geometry (wicks, bodies, threshold
+lines, marker placement at arbitrary time/price coordinates) is
+what SVG is actually suited for here, and remains SVG accordingly.
+
 ═══════════════════════════════════════════════════════════════════
-MAIN OVERVIEW TABLE (/chart.svg)
+MAIN OVERVIEW TABLE (/  — native HTML)
 ═══════════════════════════════════════════════════════════════════
 
-The main overview SVG (distinct from each symbol's own candlestick
-chart) renders a single bordered, monospaced, all-black tabular
-grid, one row per symbol, with a legend line above the grid mapping
-each abbreviated column header to its full name. Columns, in order:
+The main overview table (distinct from each symbol's own SVG
+candlestick chart) is rendered as a native HTML <table> directly in
+the "/" page — NOT as SVG. A hand-built SVG grid of <rect>/<text>
+elements is disproportionate machinery for what is fundamentally
+tabular text: it requires manually computed cell coordinates, has
+no native text wrapping, and cannot be styled or reflowed by the
+browser the way an HTML table can. The status line formerly
+duplicated inside the SVG's own title text AND separately above it
+in the page body is now shown exactly ONCE, immediately above the
+table.
+
+One row per symbol, with a legend line above the grid mapping each
+abbreviated column header to its full name. Columns, in order:
 
   Sym     Symbol code. A failed symbol has "[F]" appended directly
           after its code (e.g. "BTC_USDT[F]") since a uniform black
@@ -434,9 +458,30 @@ each abbreviated column header to its full name. Columns, in order:
           rolling chart-marker pruning window).
   Ctb     Current per-trigger contribution in USD
           (get_contrib_per_trigger_usd).
-  BudR    Current BudgetR value in USD for this symbol.
-  MOS     Minimum order size for this symbol, in contracts
-          (_mos(sym)).
+  BudR    Current BudgetR value in USD for this symbol. Always
+          USD-denominated (see BUDGET-R above) — never a contract
+          count.
+  MOS     Minimum order size for this symbol, in USD
+          (_mos_usd_from_buffer(sym)) — NOT in contracts. Every
+          configured symbol's exchange-reported minimum order
+          volume is exactly 1.0 contract (see the per-symbol
+          contract table supplied by the operator), and contract
+          size varies enormously across symbols (0.0001 for
+          SPX500_USDT vs. 10.0 for TRX_USDT), so a bare contract
+          count in this column is not comparable across rows and is
+          not directly comparable to the dollar-denominated Acc
+          column beside it. This column instead reports
+          min_vol_contracts * contractSize * last_close_price,
+          i.e. the actual USD cost of the smallest order the
+          exchange will accept, computed from that symbol's most
+          recently closed 1-minute candle already resident in
+          MINUTE_BUFFERS (see the module docstring's note under
+          "Rolling 1-minute OHLC candle buffer") rather than an
+          additional live mark-price fetch, so rendering this
+          table issues zero extra network calls. "n/a" is shown if
+          the buffer has no closed candle yet (e.g. immediately at
+          startup, before seeding completes) or if this symbol has
+          no loaded contract spec.
   Acc     Current accumulator value in USD.
   AvgEnt  Average fill price across EXECUTED (successful) orders
           only for this symbol (distinct from the daily-stats
@@ -450,11 +495,12 @@ each abbreviated column header to its full name. Columns, in order:
   Exp     Total exposure: cumulative USD notional (unlevered) summed
           across every executed order for this symbol, lifetime.
 
-All text is rendered in solid black (#000000). Gridlines and cell
-borders are drawn in a light gray for legibility without competing
-with the black text. The table height grows with the symbol count;
-width is fixed with column widths sized to comfortably fit the
-widest expected value per column.
+All cell values are HTML-escaped before insertion. The former
+TABLE_* SVG layout constants (pixel widths, row heights, margins)
+and the _table_col_x/render_svg coordinate-computation helpers no
+longer exist; column order and header labels are still driven by
+the same TABLE_COLUMNS list, now consumed by an HTML-table builder
+instead of an SVG one.
 
 ═══════════════════════════════════════════════════════════════════
 DAILY ACTIVITY REPORT (ntfy)
@@ -537,6 +583,7 @@ import collections
 import datetime
 import hashlib
 import hmac
+import html
 import http.server
 import json
 import logging
@@ -671,6 +718,13 @@ CHART_MARGIN_B = 40
 
 
 # ── overview table constants ────────────────────────────────────────────────────
+#
+# The overview table is now a native HTML <table> (see MAIN OVERVIEW
+# TABLE in the module docstring) rather than hand-laid-out SVG, so
+# the pixel-geometry constants (row heights, column pixel widths,
+# margins) that this section formerly held no longer apply — column
+# order and header labels are still driven by TABLE_COLUMNS, now
+# consumed by an HTML-table builder instead of an SVG one.
 
 TABLE_COLUMNS: List[Tuple[str, str]] = [
     # (abbreviation, full name) — order defines column order and the
@@ -679,32 +733,13 @@ TABLE_COLUMNS: List[Tuple[str, str]] = [
     ("Trg",    "Total Triggers"),
     ("Ctb",    "Contribution/Trigger (USD)"),
     ("BudR",   "BudgetR (USD)"),
-    ("MOS",    "Min Order Size (contracts)"),
+    ("MOS",    "Min Order Size (USD)"),
     ("Acc",    "Accumulator (USD)"),
     ("AvgEnt", "Average Entry Price"),
     ("Exec",   "Executed Orders"),
     ("Fail",   "Failed Orders"),
     ("Exp",    "Total Exposure (USD)"),
 ]
-
-TABLE_ROW_H       = 26
-TABLE_HEADER_H    = 26
-TABLE_LEGEND_H    = 34
-TABLE_TITLE_H     = 30
-TABLE_MARGIN      = 16
-TABLE_COL_W: Dict[str, int] = {
-    "Sym":    150,
-    "Trg":    60,
-    "Ctb":    90,
-    "BudR":   100,
-    "MOS":    100,
-    "Acc":    90,
-    "AvgEnt": 110,
-    "Exec":   70,
-    "Fail":   70,
-    "Exp":    110,
-}
-TABLE_W = TABLE_MARGIN * 2 + sum(TABLE_COL_W.values())
 
 
 # ── daily activity report / ntfy constants ────────────────────────────────────
@@ -735,8 +770,19 @@ _FAILED_LOCK = threading.Lock()
 
 
 def _xml_escape(s: str) -> str:
-    """Escapes text for safe embedding inside SVG/XML text content."""
+    """Escapes text for safe embedding inside SVG/XML text content.
+    Used exclusively by the per-symbol candlestick chart renderer
+    now that the overview table is native HTML (see
+    _html_escape below for the table's own escaping)."""
     return _saxutils.escape(str(s))
+
+
+def _html_escape(s: str) -> str:
+    """Escapes text for safe embedding inside HTML content, used by
+    the native-HTML overview table (see MAIN OVERVIEW TABLE in the
+    module docstring)."""
+    return html.escape(str(s), quote=True)
+
 
 def flag_failed(sym: str, reason: str):
     with _FAILED_LOCK:
@@ -1434,24 +1480,9 @@ class SharedState:
     def __init__(self):
         self._lock = threading.Lock()
 
-        self._svg = (
-            "<svg xmlns='http://www.w3.org/2000/svg' "
-            "width='600' height='100'>"
-            "<text x='10' y='50'>Initializing...</text>"
-            "</svg>"
-        )
-
         self._status = "initializing"
 
         self._chart_svgs: Dict[str, str] = {}
-
-    def set_svg(self, svg: str):
-        with self._lock:
-            self._svg = svg
-
-    def get_svg(self) -> str:
-        with self._lock:
-            return self._svg
 
     def set_status(self, status: str):
         with self._lock:
@@ -2140,7 +2171,49 @@ def _contracts(sym, usd, price):
 
 
 def _mos(sym):
+    """Exchange-reported minimum order size, in CONTRACTS (i.e. the
+    same units place_long/_contracts compare against when deciding
+    whether an accumulated USD amount clears the exchange's
+    minimum). This is deliberately NOT the USD-denominated figure —
+    see _mos_usd_from_buffer below for that — because place_long's
+    pre-check ('vol < _mos(sym)') must compare like-for-like against
+    _contracts(), which also returns a contract count."""
     return specs.get(sym, {}).get("vu", 1.0)
+
+
+def _mos_usd_from_buffer(sym: str) -> Optional[float]:
+    """Returns this symbol's exchange-reported minimum order size
+    converted to USD: min_vol_contracts * contractSize *
+    last_closed_1m_close. Used exclusively for DISPLAY in the
+    overview table (see MAIN OVERVIEW TABLE in the module
+    docstring) — trading logic continues to compare contract
+    quantities directly via _mos()/_contracts(), never this USD
+    figure.
+
+    Deliberately reuses the most recently closed 1-minute candle
+    already resident in MINUTE_BUFFERS rather than issuing a live
+    mark-price fetch, so that rendering the overview table adds no
+    additional network calls (see the module docstring's note under
+    "Rolling 1-minute OHLC candle buffer"). Returns None if this
+    symbol has no loaded contract spec, or if its minute buffer has
+    no closed candle yet (e.g. immediately at process startup,
+    before seeding completes) — callers display "n/a" in that case
+    rather than fabricating a figure from stale or absent data.
+    """
+    spec = specs.get(sym)
+    if spec is None:
+        return None
+
+    buf = MINUTE_BUFFERS.get(sym)
+    latest = buf.latest_closed() if buf is not None else None
+    if latest is None:
+        return None
+
+    last_close = latest["c"]
+    if last_close <= 0:
+        return None
+
+    return _mos(sym) * spec.get("cs", 1.0) * last_close
 
 
 def _effective_leverage(sym: str) -> int:
@@ -2968,16 +3041,7 @@ def run_startup_test_orders():
     )
 
 
-# ── main overview SVG (tabular) ────────────────────────────────────────────────
-
-def _table_col_x(col_key: str) -> int:
-    x = TABLE_MARGIN
-    for key, _full in TABLE_COLUMNS:
-        if key == col_key:
-            return x
-        x += TABLE_COL_W[key]
-    return x
-
+# ── main overview table (native HTML) ───────────────────────────────────────
 
 def _avg_entry_price(sym: str) -> Optional[float]:
     orders = executed_orders_for_sym(sym)
@@ -2996,94 +3060,58 @@ def _total_exposure_usd(sym: str) -> float:
     return sum(float(o.get("usd", 0.0)) for o in orders)
 
 
-def render_svg(now_utc: datetime.datetime) -> str:
-    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+def _overview_status_line(now_utc: datetime.datetime) -> str:
+    """Builds the single status line shown once above the overview
+    table. Formerly this same information (timestamp, symbol count,
+    contrib-recompute date, order/failed totals) was split across
+    two near-duplicate strings — one baked into the SVG's own title
+    text, one rendered separately in the HTML body above it. Now
+    that the table itself is native HTML rather than SVG, there is
+    exactly one place for this line to live."""
     contrib_date = get_contrib_last_computed_date()
     contrib_date_str = (
         contrib_date.isoformat() if contrib_date is not None else "pending"
     )
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    n_orders = total_orders_count()
+    n_failed = len(FAILED_SYMBOLS)
 
-    n_rows = len(SYMBOLS)
-    table_h = (
-        TABLE_TITLE_H + TABLE_LEGEND_H + TABLE_HEADER_H
-        + n_rows * TABLE_ROW_H + TABLE_MARGIN
-    )
-    W = TABLE_W
-    H = table_h
-
-    title_text = _xml_escape(
-        f'MultiLongDCA-Bot — {len(SYMBOLS)} symbols — '
-        f'minute-trigger engine — {now_str} — '
-        f'contrib weights: {contrib_date_str}'
+    return (
+        f"MultiLongDCA-Bot — {len(SYMBOLS)} symbols — "
+        f"minute-trigger engine — {now_str} — "
+        f"contrib weights: {contrib_date_str} — "
+        f"total_orders={n_orders} — failed_symbols={n_failed}"
     )
 
-    legend_text = _xml_escape(
-        "  ".join(f"{abbr}={full}" for abbr, full in TABLE_COLUMNS)
-    )
 
-    svg = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" '
-            f'viewBox="0 0 {W} {H}" '
-            f'width="100%" '
-            f'style="max-width:{W}px;display:block">'
-        ),
-        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
-        (
-            f'<text x="{TABLE_MARGIN}" y="20" '
-            f'font-family="Courier New" '
-            f'font-size="13" '
-            f'fill="#000000" '
-            f'font-weight="bold">'
-            f'{title_text}'
-            f'</text>'
-        ),
-        (
-            f'<text x="{TABLE_MARGIN}" y="{TABLE_TITLE_H + 16}" '
-            f'font-family="Courier New" '
-            f'font-size="9" '
-            f'fill="#000000">'
-            f'{legend_text}'
-            f'</text>'
-        ),
+def render_overview_table_html(now_utc: datetime.datetime) -> str:
+    """Builds the main overview table as a native HTML <table>
+    string — see MAIN OVERVIEW TABLE in the module docstring for why
+    this replaced the former hand-drawn SVG grid. Every value here
+    matches what the SVG version showed, with MOS now converted to
+    USD via _mos_usd_from_buffer instead of a bare contract count.
+    All cell text is HTML-escaped."""
+    legend = "  ".join(f"{abbr}={full}" for abbr, full in TABLE_COLUMNS)
+
+    parts = [
+        f'<p class="status">{_html_escape(_overview_status_line(now_utc))}</p>',
+        f'<p class="legend">{_html_escape(legend)}</p>',
+        '<table class="overview">',
+        '<thead><tr>',
     ]
 
-    grid_top = TABLE_TITLE_H + TABLE_LEGEND_H
-    header_y = grid_top + TABLE_HEADER_H - 8
-
-    # Header row
-    svg.append(
-        f'<rect x="{TABLE_MARGIN}" y="{grid_top}" '
-        f'width="{W - TABLE_MARGIN * 2}" height="{TABLE_HEADER_H}" '
-        f'fill="#f0f0f0" stroke="#999999" stroke-width="1"/>'
-    )
-
     for abbr, _full in TABLE_COLUMNS:
-        x = _table_col_x(abbr)
-        svg.append(
-            f'<text x="{x + 6}" y="{header_y}" '
-            f'font-family="Courier New" font-size="11" '
-            f'fill="#000000" font-weight="bold">'
-            f'{_xml_escape(abbr)}</text>'
-        )
+        parts.append(f'<th>{_html_escape(abbr)}</th>')
 
-    # Body rows
-    for i, sym in enumerate(SYMBOLS):
-        row_y = grid_top + TABLE_HEADER_H + i * TABLE_ROW_H
-        text_y = row_y + TABLE_ROW_H - 8
+    parts.append('</tr></thead>')
+    parts.append('<tbody>')
 
-        svg.append(
-            f'<rect x="{TABLE_MARGIN}" y="{row_y}" '
-            f'width="{W - TABLE_MARGIN * 2}" height="{TABLE_ROW_H}" '
-            f'fill="#ffffff" stroke="#dddddd" stroke-width="1"/>'
-        )
-
+    for sym in SYMBOLS:
         failed = is_failed(sym)
         trg = get_trigger_count(sym)
         ctb = get_contrib_per_trigger_usd(sym)
         bud_r = get_budget_r(sym)
-        mos = _mos(sym)
+        mos_usd = _mos_usd_from_buffer(sym)
         acc = get_accumulator(sym)
         avg_entry = _avg_entry_price(sym)
         exec_ok, exec_failed = get_lifetime_order_counts(sym)
@@ -3096,7 +3124,7 @@ def render_svg(now_utc: datetime.datetime) -> str:
             "Trg":    f"{trg}",
             "Ctb":    f"{ctb:,.3f}",
             "BudR":   f"{bud_r:,.2f}",
-            "MOS":    f"{mos:,.4f}",
+            "MOS":    (f"{mos_usd:,.4f}" if mos_usd is not None else "n/a"),
             "Acc":    f"{acc:,.2f}",
             "AvgEnt": (f"{avg_entry:,.4f}" if avg_entry is not None else "n/a"),
             "Exec":   f"{exec_ok}",
@@ -3104,32 +3132,14 @@ def render_svg(now_utc: datetime.datetime) -> str:
             "Exp":    f"{exposure:,.2f}",
         }
 
+        row_class = ' class="failed"' if failed else ""
+        parts.append(f'<tr{row_class}>')
         for abbr, _full in TABLE_COLUMNS:
-            x = _table_col_x(abbr)
-            svg.append(
-                f'<text x="{x + 6}" y="{text_y}" '
-                f'font-family="Courier New" font-size="10" '
-                f'fill="#000000">'
-                f'{_xml_escape(values[abbr])}</text>'
-            )
+            parts.append(f'<td>{_html_escape(values[abbr])}</td>')
+        parts.append('</tr>')
 
-    # Column separators
-    x = TABLE_MARGIN
-    for abbr, _full in TABLE_COLUMNS:
-        svg.append(
-            f'<line x1="{x}" y1="{grid_top}" '
-            f'x2="{x}" y2="{grid_top + TABLE_HEADER_H + n_rows * TABLE_ROW_H}" '
-            f'stroke="#cccccc" stroke-width="1"/>'
-        )
-        x += TABLE_COL_W[abbr]
-    svg.append(
-        f'<line x1="{x}" y1="{grid_top}" '
-        f'x2="{x}" y2="{grid_top + TABLE_HEADER_H + n_rows * TABLE_ROW_H}" '
-        f'stroke="#999999" stroke-width="1"/>'
-    )
-
-    svg.append("</svg>")
-    return "\n".join(svg)
+    parts.append('</tbody></table>')
+    return "\n".join(parts)
 
 
 # ── per-symbol chart SVG ───────────────────────────────────────────────────────
@@ -3390,9 +3400,6 @@ def engine_cycle():
 
     run_minute_checks(now_utc)
 
-    svg = render_svg(now_utc)
-    STATE.set_svg(svg)
-
     for sym in SYMBOLS:
         try:
             chart_svg = render_symbol_chart_svg(sym)
@@ -3496,16 +3503,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/chart.svg":
-            svg = STATE.get_svg().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "image/svg+xml")
-            self.send_header("Content-Length", str(len(svg)))
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(svg)
-
-        elif self.path.startswith("/chart/") and self.path.endswith(".svg"):
+        if self.path.startswith("/chart/") and self.path.endswith(".svg"):
             sym = self.path[len("/chart/"):-len(".svg")]
 
             if sym not in SYMBOLS:
@@ -3596,7 +3594,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif self.path in ("/", ""):
+            now_utc = datetime.datetime.now(UTC)
             status = STATE.get_status()
+            table_html = render_overview_table_html(now_utc)
 
             chart_links = " · ".join(
                 (
@@ -3607,7 +3607,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for sym in SYMBOLS
             )
 
-            html = (
+            html_doc = (
                 "<!doctype html>"
                 "<html>"
                 "<head>"
@@ -3616,9 +3616,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "<title>MultiLongDCA-Bot Overview</title>"
                 "<style>"
                 "body{font-family:monospace;"
-                "background:#fafafa;margin:24px}"
+                "background:#fafafa;margin:24px;color:#000}"
                 "img{max-width:100%;height:auto;"
                 "border:1px solid #ccc}"
+                "p.status{font-weight:bold;margin-bottom:4px}"
+                "p.legend{font-size:12px;color:#333;margin-top:0}"
+                "table.overview{border-collapse:collapse;"
+                "margin:8px 0 16px 0}"
+                "table.overview th,table.overview td{"
+                "border:1px solid #ccc;padding:4px 8px;"
+                "text-align:right;white-space:nowrap}"
+                "table.overview th{background:#f0f0f0;"
+                "text-align:center}"
+                "table.overview td:first-child,"
+                "table.overview th:first-child{text-align:left}"
+                "table.overview tr.failed td:first-child{color:#cc0000}"
                 "</style>"
                 "</head>"
                 "<body>"
@@ -3626,9 +3638,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "MultiLongDCA-Bot — "
                 "Multi-Symbol Minute-Trigger DCA Long Bot"
                 "</h3>"
-                f"<p>status: {status}</p>"
-                "<img src='/chart.svg' "
-                "alt='overview table'/>"
+                f"<p>engine status: {_html_escape(status)}</p>"
+                f"{table_html}"
                 f"<p>charts: {chart_links}</p>"
                 "<p>"
                 "<a href='/orders.json'>order records</a>"
@@ -3645,7 +3656,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "</html>"
             )
 
-            body = html.encode("utf-8")
+            body = html_doc.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
