@@ -676,6 +676,7 @@ SYMBOLS: List[str] = [
     "SOL_USDT",        # proxy for SOLUSD
     "XRP_USDT",        # proxy for XRPUSD
     "TRX_USDT",
+    "BNB_USDT",
     "NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium A: x
     "XAU_USDT",        # Gold A: x
