@@ -697,7 +697,7 @@ LEVERAGE = 20
 
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_MULT = 1.0     # daily budget accrual = this * that
+BUDGET_DAILY_ACCRUAL_MULT = 2.0     # daily budget accrual = this * that
                                       # symbol's current per-trigger
                                       # contribution in USD (see BUDGET
                                       # ACCRUAL in the module docstring).
