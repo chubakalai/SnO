@@ -1867,14 +1867,16 @@ def add_order_size_to_accumulator(sym: str, order_size_usd: float) -> float:
         return new
 
 
+def deduct_accumulator(sym: str, amount: float):
+    with _STATE_DATA_LOCK:
+        prev = float(STATE_DATA["accumulator"].get(sym, 0.0))
+        new = max(0.0, prev - amount)
+        STATE_DATA["accumulator"][sym] = new
+        _persist()
+
+
 def get_accumulator(sym: str) -> float:
     return float(STATE_DATA["accumulator"].get(sym, 0.0))
-
-
-def reset_accumulator(sym: str):
-    with _STATE_DATA_LOCK:
-        STATE_DATA["accumulator"][sym] = 0.0
-        _persist()
 
 
 def spend_budget(sym: str, usd: float):
@@ -2618,7 +2620,7 @@ def seed_minute_buffer(sym: str):
         log.info(
             f"[{sym}] seed chunk "
             f"[{chunk_start_s}, {chunk_end_s}): "
-            f"{len(bars)} bars fetched, "
+            f"{len(bars)} fetched, "
             f"{len(all_bars)} total so far"
         )
 
@@ -2796,18 +2798,38 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
         f"@ price={candle_low:.4f}"
     )
 
-    vol_at_price = _contracts(sym, pending, candle_low)
+    live_budget = get_budget(sym)
+    
+    # Negative budget safety stack
+    if live_budget < 0:
+        log.info(
+            f"[{sym}] budget is negative (${live_budget:.2f}) — "
+            f"stacking ${order_size_usd:.4f} on accumulator (now ${pending:.2f}) "
+            "instead of firing"
+        )
+        return
+
+    attempt_usd = pending
+    
+    # Positive budget safety cap
+    if live_budget >= 0 and pending > live_budget:
+        attempt_usd = live_budget
+        log.info(
+            f"[{sym}] pending (${pending:.2f}) exceeds positive budget "
+            f"(${live_budget:.2f}) — capping attempt to available budget (${attempt_usd:.2f})"
+        )
+
+    vol_at_price = _contracts(sym, attempt_usd, candle_low)
 
     if vol_at_price < _mos(sym):
         log.info(
-            f"[{sym}] accumulator ${pending:.2f} still below "
-            f"min order size ({_mos(sym)} contracts @ "
-            f"{candle_low:.4f}) — stacking, no order placed"
+            f"[{sym}] attempt size ${attempt_usd:.2f} below min order size "
+            f"({_mos(sym)} contracts @ {candle_low:.4f}) — stacking, no order placed"
         )
         return
 
     log.info(
-        f"[{sym}] accumulator ${pending:.2f} reaches min order "
+        f"[{sym}] accumulator attempt ${attempt_usd:.2f} reaches min order "
         f"size — attempting limit LONG @ {candle_low:.4f}"
     )
 
@@ -2815,37 +2837,34 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
         sym,
         candle_low,
         candle_low,
-        pending
+        attempt_usd
     )
 
     if oid == "SKIP" or oid is None:
         record_attempt_stat(sym, candle_low, success=False)
         record_lifetime_order_outcome(sym, success=False)
         # Accumulator is deliberately NOT reset here — it retains
-        # the order_size_usd that was just added above, so this
-        # failed attempt's amount carries forward into the next
-        # trigger's accumulation rather than being discarded. See
-        # FAILED-ORDER CARRY-FORWARD in the module docstring.
+        # the amount that was just added above, so this failed attempt's
+        # amount carries forward into the next trigger's accumulation.
         if oid == "SKIP":
             log.warning(
                 f"[{sym}] fire skipped by place_long despite "
                 "passing pre-check — leaving accumulator intact "
-                f"(carries forward ${order_size_usd:.4f} from this "
-                "trigger)"
+                f"(carries forward ${order_size_usd:.4f} from this trigger)"
             )
         else:
             log.error(
                 f"[{sym}] minute-trigger order rejected by MEXC — "
                 "leaving accumulator intact, will retry on next "
-                f"trigger (carries forward ${order_size_usd:.4f} "
-                "from this trigger)"
+                f"trigger (carries forward ${order_size_usd:.4f} from this trigger)"
             )
         return
 
-    record_attempt_stat(sym, candle_low, success=True, usd_if_success=pending)
+    record_attempt_stat(sym, candle_low, success=True, usd_if_success=attempt_usd)
     record_lifetime_order_outcome(sym, success=True)
-    reset_accumulator(sym)
-    spend_budget(sym, pending)
+    
+    deduct_accumulator(sym, attempt_usd)
+    spend_budget(sym, attempt_usd)
 
     record_order({
         "symbol": sym,
@@ -2853,7 +2872,7 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
         "candle_time": candle_dt.isoformat(),
         "order_id": oid,
         "limit_price": candle_low,
-        "usd": pending,
+        "usd": attempt_usd,
         "reference_window": ref_label,
     })
 
@@ -2873,10 +2892,9 @@ def run_minute_checks(now_utc: datetime.datetime):
 
 def build_daily_report_text(now_utc: datetime.datetime) -> str:
     """Builds the plain-text daily activity report body. Iterates
-    every symbol currently configured in SYMBOLS — i.e. every
-    actively-monitored symbol, whether presently trading or flagged
-    FAILED — so the report always reflects the FULL active symbol
-    roster and never silently omits an entry."""
+    every actively-monitored symbol, but explicitly skips appending 
+    to the text report for any symbol with ZERO triggers to strictly
+    preserve payload limits."""
     window_start = None
 
     for sym in SYMBOLS:
@@ -2888,40 +2906,20 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
 
     if window_start is not None:
         window_start_dt = datetime.datetime.fromtimestamp(window_start, tz=UTC)
-        header = (
-            f"Daily Activity Report — "
-            f"{window_start_dt.strftime('%Y-%m-%d %H:%M')} UTC "
-            f"to {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
-        )
+        header = f"Report {window_start_dt.strftime('%m-%d %H:%M')} to {now_utc.strftime('%m-%d %H:%M')} UTC"
     else:
-        header = (
-            f"Daily Activity Report — as of "
-            f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
-        )
+        header = f"Report as of {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
 
-    contrib_date = get_contrib_last_computed_date()
-    contrib_note = (
-        f"Contribution weights last computed: {contrib_date.isoformat()}"
-        if contrib_date is not None
-        else "Contribution weights: not yet computed (flat fallback in effect)"
-    )
+    lines = [header, ""]
 
-    active_count = sum(1 for sym in SYMBOLS if not is_failed(sym))
-    failed_count_total = len(SYMBOLS) - active_count
-
-    roster_note = (
-        f"Symbols covered: {len(SYMBOLS)} total "
-        f"({active_count} trading, {failed_count_total} failed/excluded)"
-    )
-
-    lines = [header, contrib_note, roster_note, ""]
-
-    # Every symbol in SYMBOLS gets a line — active and failed alike —
-    # so the report always covers the full, current roster of
-    # actively-monitored symbols with no omissions.
+    # Iterate symbols and only append non-zero activity to drastically shorten msg length.
     for sym in SYMBOLS:
         stats = get_daily_stats_snapshot(sym)
         triggers = stats["triggers"]
+        
+        if triggers == 0:
+            continue
+            
         order_value = stats["order_value_usd"]
         ok = stats["orders_ok"]
         failed_count = stats["orders_failed"]
@@ -2938,16 +2936,15 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
             f"{avg_price:,.4f}" if avg_price is not None else "n/a"
         )
 
-        excluded_note = " [EXCLUDED — not traded]" if is_failed(sym) else ""
+        excluded_note = " [F]" if is_failed(sym) else ""
         contrib = get_contrib_per_trigger_usd(sym)
 
         lines.append(
-            f"{sym}: triggers={triggers}  "
-            f"order_value=${order_value:,.2f}  "
-            f"ok={ok}  failed={failed_count}  "
-            f"avg_attempt_price={avg_price_str}  "
-            f"contrib/trigger=${contrib:.3f}"
-            f"{excluded_note}"
+            f"{sym}: trg={triggers} "
+            f"usd=${order_value:,.2f} "
+            f"ok={ok} fail={failed_count} "
+            f"avg$={avg_price_str} "
+            f"ctb=${contrib:.3f}{excluded_note}"
         )
 
     return "\n".join(lines)
