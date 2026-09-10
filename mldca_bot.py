@@ -491,11 +491,12 @@ each abbreviated column header to its full name. Columns, in order:
           (get_contrib_per_trigger_usd). NOT summed in Totals — a
           summed per-trigger USD rate across heterogeneous symbols
           has no coherent interpretation; left blank.
-  BudR    Current BudgetR value in USD for this symbol. Always
-          USD-denominated (see BUDGET-R above) — never a contract
-          count. NOT summed in Totals for the same reason as Ctb
-          (a running per-symbol reference figure, not a portfolio
-          quantity); left blank.
+  Bud(BudR)  Running budget paired with BudgetR, both in USD, shown
+          as "<budget>(<budget_r>)" — e.g. "48.55(57.77)". Both
+          figures are USD-denominated (see BUDGET-R above) — never
+          a contract count. NOT summed in Totals — running per-
+          symbol reference figures, not a portfolio quantity; left
+          blank.
   MOS     Minimum order size for this symbol, in USD
           (_mos_usd_from_buffer(sym)) — NOT in contracts. Every
           configured symbol's exchange-reported minimum order
@@ -788,16 +789,16 @@ CHART_MARGIN_B = 40
 TABLE_COLUMNS: List[Tuple[str, str]] = [
     # (abbreviation, full name) — order defines column order and the
     # legend line below the grid.
-    ("Sym",    "Symbol"),
-    ("Trg",    "Total Triggers"),
-    ("Ctb",    "Contribution/Trigger (USD)"),
-    ("BudR",   "BudgetR (USD)"),
-    ("MOS",    "Min Order Size (USD)"),
-    ("Acc",    "Accumulator (USD)"),
-    ("AvgEnt", "Average Entry Price"),
-    ("Exec",   "Executed Orders"),
-    ("Fail",   "Failed Orders"),
-    ("Exp",    "Total Exposure (USD)"),
+    ("Sym",      "Symbol"),
+    ("Trg",      "Total Triggers"),
+    ("Ctb",      "Contribution/Trigger (USD)"),
+    ("Bud(BudR)", "Budget (BudgetR) (USD)"),
+    ("MOS",      "Min Order Size (USD)"),
+    ("Acc",      "Accumulator (USD)"),
+    ("AvgEnt",   "Average Entry Price"),
+    ("Exec",     "Executed Orders"),
+    ("Fail",     "Failed Orders"),
+    ("Exp",      "Total Exposure (USD)"),
 ]
 
 TOTALS_COLUMNS = {"Trg", "Exec", "Fail", "Exp"}
@@ -2799,7 +2800,7 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
     )
 
     live_budget = get_budget(sym)
-    
+
     # Negative budget safety stack
     if live_budget < 0:
         log.info(
@@ -2810,7 +2811,7 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
         return
 
     attempt_usd = pending
-    
+
     # Positive budget safety cap
     if live_budget >= 0 and pending > live_budget:
         attempt_usd = live_budget
@@ -2862,7 +2863,7 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
 
     record_attempt_stat(sym, candle_low, success=True, usd_if_success=attempt_usd)
     record_lifetime_order_outcome(sym, success=True)
-    
+
     deduct_accumulator(sym, attempt_usd)
     spend_budget(sym, attempt_usd)
 
@@ -2892,7 +2893,7 @@ def run_minute_checks(now_utc: datetime.datetime):
 
 def build_daily_report_text(now_utc: datetime.datetime) -> str:
     """Builds the plain-text daily activity report body. Iterates
-    every actively-monitored symbol, but explicitly skips appending 
+    every actively-monitored symbol, but explicitly skips appending
     to the text report for any symbol with ZERO triggers to strictly
     preserve payload limits."""
     window_start = None
@@ -2916,10 +2917,10 @@ def build_daily_report_text(now_utc: datetime.datetime) -> str:
     for sym in SYMBOLS:
         stats = get_daily_stats_snapshot(sym)
         triggers = stats["triggers"]
-        
+
         if triggers == 0:
             continue
-            
+
         order_value = stats["order_value_usd"]
         ok = stats["orders_ok"]
         failed_count = stats["orders_failed"]
@@ -3130,12 +3131,14 @@ def render_overview_table_html(now_utc: datetime.datetime) -> str:
 
     Column values mirror the ones shown per-symbol, with MOS
     converted to USD via _mos_usd_from_buffer instead of a bare
-    contract count. A final <tfoot> row sums the columns listed in
-    TOTALS_COLUMNS (Trg, Exec, Fail, Exp); every other column is
-    left blank in that row rather than aggregated in a way that
-    would not have a coherent portfolio-level meaning (see the
-    per-column notes in the MAIN OVERVIEW TABLE docstring section).
-    All cell text is HTML-escaped.
+    contract count, and the Bud(BudR) column showing the running
+    budget paired with BudgetR as "<budget>(<budget_r>)". A final
+    <tfoot> row sums the columns listed in TOTALS_COLUMNS (Trg,
+    Exec, Fail, Exp); every other column is left blank in that row
+    rather than aggregated in a way that would not have a coherent
+    portfolio-level meaning (see the per-column notes in the MAIN
+    OVERVIEW TABLE docstring section). All cell text is
+    HTML-escaped.
     """
     legend = "  ".join(f"{abbr}={full}" for abbr, full in TABLE_COLUMNS)
 
@@ -3153,6 +3156,7 @@ def render_overview_table_html(now_utc: datetime.datetime) -> str:
         failed = is_failed(sym)
         trg = get_trigger_count(sym)
         ctb = get_contrib_per_trigger_usd(sym)
+        budget = get_budget(sym)
         bud_r = get_budget_r(sym)
         mos_usd = _mos_usd_from_buffer(sym)
         acc = get_accumulator(sym)
@@ -3168,16 +3172,16 @@ def render_overview_table_html(now_utc: datetime.datetime) -> str:
         sym_display = f"{sym}[F]" if failed else sym
 
         values = {
-            "Sym":    sym_display,
-            "Trg":    f"{trg}",
-            "Ctb":    f"{ctb:,.3f}",
-            "BudR":   f"{bud_r:,.2f}",
-            "MOS":    (f"{mos_usd:,.4f}" if mos_usd is not None else "n/a"),
-            "Acc":    f"{acc:,.2f}",
-            "AvgEnt": (f"{avg_entry:,.4f}" if avg_entry is not None else "n/a"),
-            "Exec":   f"{exec_ok}",
-            "Fail":   f"{exec_failed}",
-            "Exp":    f"{exposure:,.2f}",
+            "Sym":       sym_display,
+            "Trg":       f"{trg}",
+            "Ctb":       f"{ctb:,.3f}",
+            "Bud(BudR)": f"{budget:,.2f}({bud_r:,.2f})",
+            "MOS":       (f"{mos_usd:,.4f}" if mos_usd is not None else "n/a"),
+            "Acc":       f"{acc:,.2f}",
+            "AvgEnt":    (f"{avg_entry:,.4f}" if avg_entry is not None else "n/a"),
+            "Exec":      f"{exec_ok}",
+            "Fail":      f"{exec_failed}",
+            "Exp":       f"{exposure:,.2f}",
         }
 
         row_class = ' class="failed"' if failed else ""
