@@ -2221,10 +2221,14 @@ def _rfmt_price(sym, v):
 
 def _rfmt_vol(sym, v):
     p = _prec(sym)
+    v += 1e-9  # mitigate floating point truncation artifacts
     if p >= 0:
-        return f"{round(v, p):.{p}f}"
+        factor = 10 ** p
+        truncated = math.floor(v * factor) / factor
+        return f"{truncated:.{p}f}"
     d = 10 ** abs(p)
-    return str(int(round(v / d) * d))
+    truncated = math.floor(v / d) * d
+    return str(int(truncated))
 
 
 def _contracts(sym, usd, price):
@@ -2821,17 +2825,22 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
         )
 
     vol_at_price = _contracts(sym, attempt_usd, candle_low)
+    
+    # Evaluate the exact cost equivalent for the fully-truncated contract volume
+    cs = specs.get(sym, {}).get("cs", 1.0)
+    actual_usd = vol_at_price * cs * candle_low
 
     if vol_at_price < _mos(sym):
         log.info(
-            f"[{sym}] attempt size ${attempt_usd:.2f} below min order size "
+            f"[{sym}] attempt size ${attempt_usd:.2f} (vol={vol_at_price}) below min order size "
             f"({_mos(sym)} contracts @ {candle_low:.4f}) — stacking, no order placed"
         )
         return
 
     log.info(
         f"[{sym}] accumulator attempt ${attempt_usd:.2f} reaches min order "
-        f"size — attempting limit LONG @ {candle_low:.4f}"
+        f"size — attempting limit LONG {vol_at_price} contracts @ {candle_low:.4f} "
+        f"(actual cost: ${actual_usd:.2f})"
     )
 
     oid = place_long(
@@ -2861,11 +2870,11 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
             )
         return
 
-    record_attempt_stat(sym, candle_low, success=True, usd_if_success=attempt_usd)
+    record_attempt_stat(sym, candle_low, success=True, usd_if_success=actual_usd)
     record_lifetime_order_outcome(sym, success=True)
 
-    deduct_accumulator(sym, attempt_usd)
-    spend_budget(sym, attempt_usd)
+    deduct_accumulator(sym, actual_usd)
+    spend_budget(sym, actual_usd)
 
     record_order({
         "symbol": sym,
@@ -2873,7 +2882,7 @@ def process_symbol_minute(sym: str, now_utc: datetime.datetime):
         "candle_time": candle_dt.isoformat(),
         "order_id": oid,
         "limit_price": candle_low,
-        "usd": attempt_usd,
+        "usd": actual_usd,
         "reference_window": ref_label,
     })
 
