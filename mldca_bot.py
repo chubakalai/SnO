@@ -678,20 +678,20 @@ SYMBOLS: List[str] = [
     "XRP_USDT",        # proxy for XRPUSD
     "TRX_USDT",
     "BNB_USDT",
-    "NGAS_USDT",       # Natural Gas
+    #"NGAS_USDT",       # Natural Gas
     "XPD_USDT",        # Palladium A: x
-    "XAU_USDT",        # Gold A: x
+    #"XAU_USDT",        # Gold A: x
     "MSTRSTOCK_USDT",  # MicroStrategy
-    "UNITREE_USDT",    # A: x
-    "SPX500_USDT",     # S&P 500 Index A: x
-    "EWJ_USDT",        # iShares MSCI Japan ETF A: x
-    "EWY_USDT",        # iShares MSCI South Korea ETF A: x
+    #"UNITREE_USDT",    # A: x
+    #"SPX500_USDT",     # S&P 500 Index A: x
+    #"EWJ_USDT",        # iShares MSCI Japan ETF A: x
+    #"EWY_USDT",        # iShares MSCI South Korea ETF A: x
     "HK0700_USDT",     # Tencent Holdings (0700.HK)
     "INDA_USDT",       # iShares MSCI India ETF
-    "EWT_USDT",        # iShares MSCI Taiwan ETF A: x
-    "SMH_USDT",        # VanEck Semiconductor ETF A: x
-    "COPPER_USDT",     # Copper A: x
-    "BKRSTOCK_USDT",   # Baker Hughes A: x
+    #"EWT_USDT",        # iShares MSCI Taiwan ETF A: x
+    #"SMH_USDT",        # VanEck Semiconductor ETF A: x
+    #"COPPER_USDT",     # Copper A: x
+    #"BKRSTOCK_USDT",   # Baker Hughes A: x
 ]
 
 LEVERAGE = 20
