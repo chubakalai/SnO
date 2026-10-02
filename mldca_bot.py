@@ -75,6 +75,17 @@ Rolling 1-minute OHLC candle buffer (per symbol):
     already resident in the buffer rather than issuing a live mark-
     price fetch, so rendering the table adds no network calls.
 
+RAM EFFICIENCY NOTE:
+  Each MinuteBuffer stores its bars in flat typed arrays
+  (array('q') for timestamps, array('d') for o/h/l/c) rather than
+  as a deque of Python dicts. This preserves the exact same data
+  and public API (seed/append_new/latest_closed/rolling_low/
+  snapshot/size) while cutting per-bar memory from ~400 bytes to
+  ~40 bytes. Everything outside MinuteBuffer — chart rendering,
+  rolling-low computation, the MOS display, resampling — continues
+  to consume the same dict-shaped bars via snapshot()/latest_closed()
+  and requires no changes.
+
 ═══════════════════════════════════════════════════════════════════
 STRICT NEW-LOW SEMANTICS
 ═══════════════════════════════════════════════════════════════════
@@ -629,6 +640,7 @@ IMPORTANT:
   The bot does not hardcode priceUnit, volUnit, or contractSize.
 """
 
+import array
 import collections
 import datetime
 import hashlib
@@ -2502,45 +2514,102 @@ def fetch_minute_bars(
 
 
 # ── per-symbol rolling 1-minute OHLC buffer ───────────────────────────────────
+#
+# RAM-efficient storage: bars live in five flat typed arrays
+# (array('q') for timestamps, array('d') for o/h/l/c) rather than as
+# a deque of Python dicts. This preserves the exact same data and
+# the exact same public API — seed, append_new, latest_closed,
+# rolling_low, snapshot, size — so every caller outside this class
+# (chart rendering, resampling, MOS-from-buffer, minute-trigger
+# checks) continues to consume dict-shaped bars unchanged. Per-bar
+# cost drops from ~400 bytes to ~40 bytes.
 
 class MinuteBuffer:
+    """Per-symbol rolling 1-minute OHLC store backed by flat typed
+    arrays. Column layout: _t[i], _o[i], _h[i], _l[i], _c[i] all
+    refer to the same bar. Bars are kept sorted ascending by _t and
+    trimmed from the front to BUFFER_MAX_MINUTES."""
+
+    __slots__ = ("_t", "_o", "_h", "_l", "_c", "lock")
 
     def __init__(self):
-        self.bars: Deque[Dict] = collections.deque()
+        self._t = array.array("q")
+        self._o = array.array("d")
+        self._h = array.array("d")
+        self._l = array.array("d")
+        self._c = array.array("d")
         self.lock = threading.Lock()
+
+    # ── internal helpers (assume self.lock held by caller) ────────────
+
+    def _append_bar_locked(self, t, o, h, l, c):
+        self._t.append(t)
+        self._o.append(o)
+        self._h.append(h)
+        self._l.append(l)
+        self._c.append(c)
+
+    def _trim_locked(self):
+        cutoff = int(time.time()) - BUFFER_MAX_MINUTES * 60
+        n = len(self._t)
+        i = 0
+        while i < n and self._t[i] < cutoff:
+            i += 1
+        if i:
+            del self._t[:i]
+            del self._o[:i]
+            del self._h[:i]
+            del self._l[:i]
+            del self._c[:i]
+
+    def _sort_and_trim_locked(self):
+        n = len(self._t)
+        if n >= 2:
+            order = sorted(range(n), key=self._t.__getitem__)
+            if order != list(range(n)):
+                self._t = array.array("q", (self._t[i] for i in order))
+                self._o = array.array("d", (self._o[i] for i in order))
+                self._h = array.array("d", (self._h[i] for i in order))
+                self._l = array.array("d", (self._l[i] for i in order))
+                self._c = array.array("d", (self._c[i] for i in order))
+        self._trim_locked()
+
+    # ── public API (same signatures/shapes as before) ─────────────────
 
     def seed(self, bars: List[Dict]):
         with self.lock:
-            self.bars = collections.deque(bars)
+            self._t = array.array("q", (b["t"] for b in bars))
+            self._o = array.array("d", (b["o"] for b in bars))
+            self._h = array.array("d", (b["h"] for b in bars))
+            self._l = array.array("d", (b["l"] for b in bars))
+            self._c = array.array("d", (b["c"] for b in bars))
             self._trim_locked()
 
     def append_new(self, bars: List[Dict]):
         with self.lock:
-            existing_ts = {b["t"] for b in self.bars}
+            existing_ts = set(self._t)
 
             for b in bars:
                 if b["t"] not in existing_ts:
-                    self.bars.append(b)
+                    self._append_bar_locked(
+                        b["t"], b["o"], b["h"], b["l"], b["c"]
+                    )
                     existing_ts.add(b["t"])
 
             self._sort_and_trim_locked()
 
-    def _sort_and_trim_locked(self):
-        self.bars = collections.deque(
-            sorted(self.bars, key=lambda b: b["t"])
-        )
-        self._trim_locked()
-
-    def _trim_locked(self):
-        cutoff = int(time.time()) - BUFFER_MAX_MINUTES * 60
-        while self.bars and self.bars[0]["t"] < cutoff:
-            self.bars.popleft()
-
     def latest_closed(self) -> Optional[Dict]:
         with self.lock:
-            if not self.bars:
+            if not self._t:
                 return None
-            return self.bars[-1]
+            i = len(self._t) - 1
+            return {
+                "t": self._t[i],
+                "o": self._o[i],
+                "h": self._h[i],
+                "l": self._l[i],
+                "c": self._c[i],
+            }
 
     def rolling_low(
         self,
@@ -2560,30 +2629,40 @@ class MinuteBuffer:
         rather than against a set that trivially includes itself.
         """
         with self.lock:
-            if not self.bars:
+            n = len(self._t)
+            if n == 0:
+                return None
+
+            end = n - 1 if exclude_latest else n
+            if end <= 0:
                 return None
 
             cutoff = int(time.time()) - window_minutes * 60
 
-            bars = self.bars
-
-            if exclude_latest:
-                bars = list(bars)[:-1]
-
-            window = [b["l"] for b in bars if b["t"] >= cutoff]
-
-            if not window:
-                return None
-
-            return min(window)
+            m: Optional[float] = None
+            for i in range(end):
+                if self._t[i] >= cutoff:
+                    v = self._l[i]
+                    if m is None or v < m:
+                        m = v
+            return m
 
     def snapshot(self) -> List[Dict]:
         with self.lock:
-            return list(self.bars)
+            return [
+                {
+                    "t": self._t[i],
+                    "o": self._o[i],
+                    "h": self._h[i],
+                    "l": self._l[i],
+                    "c": self._c[i],
+                }
+                for i in range(len(self._t))
+            ]
 
     def size(self) -> int:
         with self.lock:
-            return len(self.bars)
+            return len(self._t)
 
 
 MINUTE_BUFFERS: Dict[str, MinuteBuffer] = {
