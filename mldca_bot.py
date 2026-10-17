@@ -711,7 +711,7 @@ LEVERAGE = 20
 
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_MULT = 2.0     # daily budget accrual = this * that
+BUDGET_DAILY_ACCRUAL_MULT = 3.0     # daily budget accrual = this * that
                                       # symbol's current per-trigger
                                       # contribution in USD (see BUDGET
                                       # ACCRUAL in the module docstring).
@@ -734,7 +734,7 @@ MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 
 # ── contribution-weighting constants ──────────────────────────────────────────
 
-BASE_TRIGGER_USD = 1.0   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
+BASE_TRIGGER_USD = 1.50   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
 
 CONTRIB_LOOKBACK_DAYS = 90
 
