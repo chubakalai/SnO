@@ -683,23 +683,23 @@ PAGE_TITLE = "MLowDCA — Execution and Monitoring"
 
 SYMBOLS: List[str] = [
     "USOIL_USDT",      # proxy for UOILUSD (WTI)
-    "URNM_USDT",       # proxy for URNMUSD
+    #"URNM_USDT",       # proxy for URNMUSD
     "BTC_USDT",        # proxy for BTCUSD
     "ETH_USDT",        # proxy for ETHUSD
     "SOL_USDT",        # proxy for SOLUSD
     "XRP_USDT",        # proxy for XRPUSD
-    "TRX_USDT",
-    "BNB_USDT",
+    #"TRX_USDT",
+    #"BNB_USDT",
     #"NGAS_USDT",       # Natural Gas
-    "XPD_USDT",        # Palladium A: x
+    #"XPD_USDT",        # Palladium A: x
     #"XAU_USDT",        # Gold A: x
     "MSTRSTOCK_USDT",  # MicroStrategy
     "UNITREE_USDT",    # A: x
     #"SPX500_USDT",     # S&P 500 Index A: x
     #"EWJ_USDT",        # iShares MSCI Japan ETF A: x
     #"EWY_USDT",        # iShares MSCI South Korea ETF A: x
-    "HK0700_USDT",     # Tencent Holdings (0700.HK)
-    "INDA_USDT",       # iShares MSCI India ETF
+    #"HK0700_USDT",     # Tencent Holdings (0700.HK)
+    #"INDA_USDT",       # iShares MSCI India ETF
     #"EWT_USDT",        # iShares MSCI Taiwan ETF A: x
     #"SMH_USDT",        # VanEck Semiconductor ETF A: x
     #"COPPER_USDT",     # Copper A: x
