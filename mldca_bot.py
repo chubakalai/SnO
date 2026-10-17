@@ -694,7 +694,7 @@ SYMBOLS: List[str] = [
     #"XPD_USDT",        # Palladium A: x
     #"XAU_USDT",        # Gold A: x
     "MSTRSTOCK_USDT",  # MicroStrategy
-    "UNITREE_USDT",    # A: x
+    #"UNITREE_USDT",    # A: x
     #"SPX500_USDT",     # S&P 500 Index A: x
     #"EWJ_USDT",        # iShares MSCI Japan ETF A: x
     #"EWY_USDT",        # iShares MSCI South Korea ETF A: x
