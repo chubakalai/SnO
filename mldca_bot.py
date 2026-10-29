@@ -708,10 +708,10 @@ SYMBOLS: List[str] = [
 
 LEVERAGE = 20
 
-
+BASELINE_MULTIPLIER=1.33
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_MULT = 1.33     # daily budget accrual = this * that
+BUDGET_DAILY_ACCRUAL_MULT = BASELINE_MULTIPLIER     # daily budget accrual = this * that
                                       # symbol's current per-trigger
                                       # contribution in USD (see BUDGET
                                       # ACCRUAL in the module docstring).
@@ -734,7 +734,7 @@ MINUTE_CHECK_SECOND = 1              # run the check at :01 past each minute
 
 # ── contribution-weighting constants ──────────────────────────────────────────
 
-BASE_TRIGGER_USD = 1.33   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
+BASE_TRIGGER_USD = BASELINE_MULTIPLIER   # equal-weight baseline; matches legacy TRIGGER_STACK_USD
 
 CONTRIB_LOOKBACK_DAYS = 90
 
