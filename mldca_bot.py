@@ -699,7 +699,7 @@ SYMBOLS: List[str] = [
     #"EWJ_USDT",        # iShares MSCI Japan ETF A: x
     #"EWY_USDT",        # iShares MSCI South Korea ETF A: x
     #"HK0700_USDT",     # Tencent Holdings (0700.HK)
-    #"INDA_USDT",       # iShares MSCI India ETF
+    "INDA_USDT",       # iShares MSCI India ETF
     #"EWT_USDT",        # iShares MSCI Taiwan ETF A: x
     #"SMH_USDT",        # VanEck Semiconductor ETF A: x
     #"COPPER_USDT",     # Copper A: x
