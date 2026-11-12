@@ -290,7 +290,7 @@ At every UTC midnight (once per UTC calendar day, gated exactly as
 before via last_accrual_date), each symbol's running budget is
 credited with:
 
-    accrual_usd = 10.0 * contrib_per_trigger_usd(sym)
+    accrual_usd = 20.0 * contrib_per_trigger_usd(sym) / num_assets
 
 using that symbol's CURRENT cached per-trigger contribution — i.e.
 the same value read by get_contrib_per_trigger_usd, which defaults
@@ -717,12 +717,10 @@ BASELINE_MULTIPLIER_HALFLIFE_DAYS = 180.0
 BASELINE_MULTIPLIER = 1.0
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_MULT = BASELINE_MULTIPLIER     # daily budget accrual = this * that
-                                      # symbol's current per-trigger
-                                      # contribution in USD (see BUDGET
-                                      # ACCRUAL in the module docstring).
-                                      # Replaces the former flat
-                                      # BUDGET_DAILY_ACCRUAL_USD ($10).
+BUDGET_DAILY_ACCRUAL_FACTOR = 20.0   # daily budget accrual per symbol =
+                                      # FACTOR * contribution[sym] / num_assets
+                                      # (num_assets = len(SYMBOLS)). Independent
+                                      # of BASELINE_MULTIPLIER.
 TRIGGER_STACK_USD        = 1.0       # default get_contrib_per_trigger_usd
                                       # returns for a symbol whose
                                       # contribution has never been computed.
@@ -1729,7 +1727,8 @@ def accrue_daily_budget_if_due(sym: str, today: datetime.date):
         contrib = float(
             STATE_DATA["contrib_per_trigger_usd"].get(sym, TRIGGER_STACK_USD)
         )
-        accrual = BUDGET_DAILY_ACCRUAL_MULT * contrib
+        num_assets = max(1, len(SYMBOLS))
+        accrual = BUDGET_DAILY_ACCRUAL_FACTOR * contrib / num_assets
 
         prev_budget = get_budget(sym)
         new_budget = prev_budget + accrual
@@ -1740,8 +1739,8 @@ def accrue_daily_budget_if_due(sym: str, today: datetime.date):
 
         log.info(
             f"[{sym}] daily budget accrual "
-            f"({BUDGET_DAILY_ACCRUAL_MULT:.4f} x contrib "
-            f"${contrib:.3f} = ${accrual:.3f}): "
+            f"({BUDGET_DAILY_ACCRUAL_FACTOR:.1f} x contrib "
+            f"${contrib:.3f} / {num_assets} assets = ${accrual:.3f}): "
             f"{prev_budget:.2f} + {accrual:.2f} "
             f"= {new_budget:.2f}"
         )
@@ -3556,7 +3555,7 @@ def update_baseline_multiplier(now_utc: Optional[datetime.datetime] = None) -> f
     2 ** (days since 2026-11-01 UTC / 180). Called at the start of
     every engine iteration so BASE_TRIGGER_USD and the daily budget
     accrual multiplier always reflect the current time."""
-    global BASELINE_MULTIPLIER, BUDGET_DAILY_ACCRUAL_MULT, BASE_TRIGGER_USD
+    global BASELINE_MULTIPLIER, BASE_TRIGGER_USD
 
     if now_utc is None:
         now_utc = datetime.datetime.now(UTC)
@@ -3565,7 +3564,6 @@ def update_baseline_multiplier(now_utc: Optional[datetime.datetime] = None) -> f
     mult = 2.0 ** (days / BASELINE_MULTIPLIER_HALFLIFE_DAYS)
 
     BASELINE_MULTIPLIER = mult
-    BUDGET_DAILY_ACCRUAL_MULT = mult
     BASE_TRIGGER_USD = mult
     return mult
 
