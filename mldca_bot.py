@@ -685,9 +685,9 @@ SYMBOLS: List[str] = [
     "USOIL_USDT",      # proxy for UOILUSD (WTI)
     #"URNM_USDT",       # proxy for URNMUSD
     "BTC_USDT",        # proxy for BTCUSD
-    "ETH_USDT",        # proxy for ETHUSD
-    "SOL_USDT",        # proxy for SOLUSD
-    "XRP_USDT",        # proxy for XRPUSD
+    #"ETH_USDT",        # proxy for ETHUSD
+    #"SOL_USDT",        # proxy for SOLUSD
+    #"XRP_USDT",        # proxy for XRPUSD
     #"TRX_USDT",
     #"BNB_USDT",
     #"NGAS_USDT",       # Natural Gas
