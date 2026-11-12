@@ -708,7 +708,13 @@ SYMBOLS: List[str] = [
 
 LEVERAGE = 20
 
-BASELINE_MULTIPLIER=1.33
+# Baseline multiplier is recomputed at every engine iteration as
+#     2 ** (days_since_2026-11-01 / 180)
+# (fractional days, UTC). The constants below are initial values only;
+# update_baseline_multiplier() overwrites them each cycle.
+BASELINE_MULTIPLIER_EPOCH = datetime.datetime(2026, 8, 1, tzinfo=UTC)
+BASELINE_MULTIPLIER_HALFLIFE_DAYS = 180.0
+BASELINE_MULTIPLIER = 1.0
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
 BUDGET_DAILY_ACCRUAL_MULT = BASELINE_MULTIPLIER     # daily budget accrual = this * that
@@ -1734,7 +1740,7 @@ def accrue_daily_budget_if_due(sym: str, today: datetime.date):
 
         log.info(
             f"[{sym}] daily budget accrual "
-            f"({BUDGET_DAILY_ACCRUAL_MULT:.1f} x contrib "
+            f"({BUDGET_DAILY_ACCRUAL_MULT:.4f} x contrib "
             f"${contrib:.3f} = ${accrual:.3f}): "
             f"{prev_budget:.2f} + {accrual:.2f} "
             f"= {new_budget:.2f}"
@@ -3543,10 +3549,33 @@ def _seconds_until_next_minute_mark() -> float:
     return next_mark - now
 
 
+# ── baseline multiplier ──────────────────────────────────────────────────────
+
+def update_baseline_multiplier(now_utc: Optional[datetime.datetime] = None) -> float:
+    """Sets BASELINE_MULTIPLIER (and the globals derived from it) to
+    2 ** (days since 2026-11-01 UTC / 180). Called at the start of
+    every engine iteration so BASE_TRIGGER_USD and the daily budget
+    accrual multiplier always reflect the current time."""
+    global BASELINE_MULTIPLIER, BUDGET_DAILY_ACCRUAL_MULT, BASE_TRIGGER_USD
+
+    if now_utc is None:
+        now_utc = datetime.datetime.now(UTC)
+
+    days = (now_utc - BASELINE_MULTIPLIER_EPOCH).total_seconds() / 86400.0
+    mult = 2.0 ** (days / BASELINE_MULTIPLIER_HALFLIFE_DAYS)
+
+    BASELINE_MULTIPLIER = mult
+    BUDGET_DAILY_ACCRUAL_MULT = mult
+    BASE_TRIGGER_USD = mult
+    return mult
+
+
 # ── engine cycle ─────────────────────────────────────────────────────────────
 
 def engine_cycle():
     now_utc = datetime.datetime.now(UTC)
+
+    update_baseline_multiplier(now_utc)
 
     try:
         recompute_contributions_if_due(now_utc.date())
@@ -3598,6 +3627,7 @@ def run_engine():
     load_specs()
 
     now_utc = datetime.datetime.now(UTC)
+    update_baseline_multiplier(now_utc)
     log.info("recomputing contribution weights on startup")
     try:
         recompute_contributions_if_due(now_utc.date(), force=True)
