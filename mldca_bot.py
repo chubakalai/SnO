@@ -682,7 +682,7 @@ PAGE_TITLE = "MLowDCA — Execution and Monitoring"
 
 
 SYMBOLS: List[str] = [
-    "USOIL_USDT",      # proxy for UOILUSD (WTI)
+    #"USOIL_USDT",      # proxy for UOILUSD (WTI)
     #"URNM_USDT",       # proxy for URNMUSD
     "BTC_USDT",        # proxy for BTCUSD
     #"ETH_USDT",        # proxy for ETHUSD
