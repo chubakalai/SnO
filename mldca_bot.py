@@ -685,16 +685,16 @@ SYMBOLS: List[str] = [
     #"USOIL_USDT",      # proxy for UOILUSD (WTI)
     #"URNM_USDT",       # proxy for URNMUSD
     "BTC_USDT",        # proxy for BTCUSD
-    "ETH_USDT",        # proxy for ETHUSD
-    "SOL_USDT",        # proxy for SOLUSD
-    "XRP_USDT",        # proxy for XRPUSD
+    #"ETH_USDT",        # proxy for ETHUSD
+    #"SOL_USDT",        # proxy for SOLUSD
+    #"XRP_USDT",        # proxy for XRPUSD
     #"TRX_USDT",
     #"BNB_USDT",
     #"NGAS_USDT",       # Natural Gas
     #"XPD_USDT",        # Palladium A: x
     #"XAU_USDT",        # Gold A: x
-    "MSTRSTOCK_USDT",  # MicroStrategy
-    #"UNITREE_USDT",    # A: x
+    #"MSTRSTOCK_USDT",  # MicroStrategy
+    "UNITREE_USDT",    # A: x
     #"SPX500_USDT",     # S&P 500 Index A: x
     #"EWJ_USDT",        # iShares MSCI Japan ETF A: x
     #"EWY_USDT",        # iShares MSCI South Korea ETF A: x
