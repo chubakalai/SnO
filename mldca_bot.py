@@ -717,7 +717,7 @@ BASELINE_MULTIPLIER_HALFLIFE_DAYS = 180.0
 BASELINE_MULTIPLIER = 1.0
 # ── minute-trigger engine constants ───────────────────────────────────────────
 
-BUDGET_DAILY_ACCRUAL_FACTOR = 20.0   # daily budget accrual per symbol =
+BUDGET_DAILY_ACCRUAL_FACTOR = 69.0   # daily budget accrual per symbol =
                                       # FACTOR * contribution[sym] / num_assets
                                       # (num_assets = len(SYMBOLS)). Independent
                                       # of BASELINE_MULTIPLIER.
